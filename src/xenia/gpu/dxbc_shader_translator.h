@@ -26,6 +26,17 @@ class DxbcShaderTranslator : public ShaderTranslator {
   DxbcShaderTranslator();
   ~DxbcShaderTranslator() override;
 
+  enum : uint32_t {
+    kSysFlag_XYDividedByW = 1,
+    kSysFlag_ZDividedByW = kSysFlag_XYDividedByW << 1,
+    kSysFlag_WNotReciprocal = kSysFlag_ZDividedByW << 1,
+    kSysFlag_ReverseZ = kSysFlag_WNotReciprocal << 1,
+    kSysFlag_Color0Gamma = kSysFlag_ReverseZ << 1,
+    kSysFlag_Color1Gamma = kSysFlag_Color0Gamma << 1,
+    kSysFlag_Color2Gamma = kSysFlag_Color1Gamma << 1,
+    kSysFlag_Color3Gamma = kSysFlag_Color2Gamma << 1
+  };
+
   // IF SYSTEM CONSTANTS ARE CHANGED OR ADDED, THE FOLLOWING MUST BE UPDATED:
   // - kSysConst enum (registers and first components).
   // - rdef_constants_.
@@ -33,9 +44,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
   // - d3d12/shaders/xenos_draw.hlsli (for geometry shaders).
   struct SystemConstants {
     // vec4 0
+    uint32_t flags;
     uint32_t vertex_index_endian;
     uint32_t vertex_base_index;
-    uint32_t ndc_control;
     uint32_t pixel_pos_reg;
 
     // vec4 1
@@ -49,17 +60,23 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
     // vec4 3
     float point_size[2];
-    float ssaa_inv_scale[2];
+    float point_size_min_max[2];
 
     // vec3 4
-    // The range is floats as uints so it's easier to pass infinity.
-    uint32_t alpha_test_range[2];
-    uint32_t padding_4[2];
+    // Inverse scale of the host viewport (but not supersampled), with signs
+    // pre-applied.
+    float point_screen_to_ndc[2];
+    float ssaa_inv_scale[2];
 
     // vec4 5
-    float color_exp_bias[4];
+    // The range is floats as uints so it's easier to pass infinity.
+    uint32_t alpha_test_range[2];
+    uint32_t padding_5[2];
 
     // vec4 6
+    float color_exp_bias[4];
+
+    // vec4 7
     uint32_t color_output_map[4];
   };
 
@@ -140,12 +157,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
   };
 
   enum : uint32_t {
+    kSysConst_Flags_Vec = 0,
+    kSysConst_Flags_Comp = 0,
     kSysConst_VertexIndexEndian_Vec = 0,
-    kSysConst_VertexIndexEndian_Comp = 0,
+    kSysConst_VertexIndexEndian_Comp = 1,
     kSysConst_VertexBaseIndex_Vec = 0,
-    kSysConst_VertexBaseIndex_Comp = 1,
-    kSysConst_NDCControl_Vec = 0,
-    kSysConst_NDCControl_Comp = 2,
+    kSysConst_VertexBaseIndex_Comp = 2,
     kSysConst_PixelPosReg_Vec = 0,
     kSysConst_PixelPosReg_Comp = 3,
 
@@ -161,15 +178,20 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
     kSysConst_PointSize_Vec = 3,
     kSysConst_PointSize_Comp = 0,
-    kSysConst_SSAAInvScale_Vec = 3,
+    kSysConst_PointSizeMinMax_Vec = 3,
+    kSysConst_PointSizeMinMax_Comp = 2,
+
+    kSysConst_PointScreenToNDC_Vec = 4,
+    kSysConst_PointScreenToNDC_Comp = 0,
+    kSysConst_SSAAInvScale_Vec = 4,
     kSysConst_SSAAInvScale_Comp = 2,
 
-    kSysConst_AlphaTestRange_Vec = 4,
+    kSysConst_AlphaTestRange_Vec = 5,
     kSysConst_AlphaTestRange_Comp = 0,
 
-    kSysConst_ColorExpBias_Vec = 5,
+    kSysConst_ColorExpBias_Vec = 6,
 
-    kSysConst_ColorOutputMap_Vec = 6,
+    kSysConst_ColorOutputMap_Vec = 7,
   };
 
   static constexpr uint32_t kInterpolatorCount = 16;
@@ -439,15 +461,17 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
   enum class RdefConstantIndex {
     kSystemConstantFirst,
-    kSysVertexBaseIndex = kSystemConstantFirst,
+    kSysFlags = kSystemConstantFirst,
+    kSysVertexBaseIndex,
     kSysVertexIndexEndian,
-    kSysNDCControl,
     kSysPixelPosReg,
     kSysNDCScale,
     kSysPixelHalfPixelOffset,
     kSysNDCOffset,
     kSysAlphaTest,
     kSysPointSize,
+    kSysPointSizeMinMax,
+    kSysPointScreenToNDC,
     kSysSSAAInvScale,
     kSysAlphaTestRange,
     kSysColorExpBias,

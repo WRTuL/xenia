@@ -1367,6 +1367,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   uint32_t pa_cl_clip_cntl = regs[XE_GPU_REG_PA_CL_CLIP_CNTL].u32;
   uint32_t pa_su_vtx_cntl = regs[XE_GPU_REG_PA_SU_VTX_CNTL].u32;
   uint32_t pa_su_point_size = regs[XE_GPU_REG_PA_SU_POINT_SIZE].u32;
+  uint32_t pa_su_point_minmax = regs[XE_GPU_REG_PA_SU_POINT_MINMAX].u32;
   uint32_t sq_program_cntl = regs[XE_GPU_REG_SQ_PROGRAM_CNTL].u32;
   uint32_t sq_context_misc = regs[XE_GPU_REG_SQ_CONTEXT_MISC].u32;
   uint32_t rb_surface_info = regs[XE_GPU_REG_RB_SURFACE_INFO].u32;
@@ -1375,14 +1376,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
 
   bool dirty = false;
 
-  // Vertex index offset.
-  dirty |= system_constants_.vertex_base_index != vgt_indx_offset;
-  system_constants_.vertex_base_index = vgt_indx_offset;
-
-  // Index buffer endianness.
-  dirty |= system_constants_.vertex_index_endian != uint32_t(index_endian);
-  system_constants_.vertex_index_endian = uint32_t(index_endian);
-
+  // Flags.
+  uint32_t flags = 0;
   // W0 division control.
   // http://www.x.org/docs/AMD/old/evergreen_3D_registers_v2.pdf
   // 8: VTX_XY_FMT = true: the incoming XY have already been multiplied by 1/W0.
@@ -1391,14 +1386,47 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   //              = false: multiply the Z coordinate by 1/W0.
   // 10: VTX_W0_FMT = true: the incoming W0 is not 1/W0. Perform the reciprocal
   //                        to get 1/W0.
-  uint32_t ndc_control = (pa_cl_vte_cntl >> 8) & 0x7;
+  if (pa_cl_vte_cntl & (1 << 8)) {
+    flags |= DxbcShaderTranslator::kSysFlag_XYDividedByW;
+  }
+  if (pa_cl_vte_cntl & (1 << 9)) {
+    flags |= DxbcShaderTranslator::kSysFlag_ZDividedByW;
+  }
+  if (pa_cl_vte_cntl & (1 << 10)) {
+    flags |= DxbcShaderTranslator::kSysFlag_WNotReciprocal;
+  }
   // Reversed depth.
   if ((pa_cl_vte_cntl & (1 << 4)) &&
       regs[XE_GPU_REG_PA_CL_VPORT_ZSCALE].f32 < 0.0f) {
-    ndc_control |= 1 << 3;
+    flags |= DxbcShaderTranslator::kSysFlag_ReverseZ;
   }
-  dirty |= system_constants_.ndc_control != ndc_control;
-  system_constants_.ndc_control = ndc_control;
+  // Gamma writing.
+  if (((regs[XE_GPU_REG_RB_COLOR_INFO].u32 >> 16) & 0xF) ==
+      uint32_t(ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+    flags |= DxbcShaderTranslator::kSysFlag_Color0Gamma;
+  }
+  if (((regs[XE_GPU_REG_RB_COLOR1_INFO].u32 >> 16) & 0xF) ==
+      uint32_t(ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+    flags |= DxbcShaderTranslator::kSysFlag_Color1Gamma;
+  }
+  if (((regs[XE_GPU_REG_RB_COLOR2_INFO].u32 >> 16) & 0xF) ==
+      uint32_t(ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+    flags |= DxbcShaderTranslator::kSysFlag_Color2Gamma;
+  }
+  if (((regs[XE_GPU_REG_RB_COLOR3_INFO].u32 >> 16) & 0xF) ==
+      uint32_t(ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+    flags |= DxbcShaderTranslator::kSysFlag_Color3Gamma;
+  }
+  dirty |= system_constants_.flags != flags;
+  system_constants_.flags = flags;
+
+  // Vertex index offset.
+  dirty |= system_constants_.vertex_base_index != vgt_indx_offset;
+  system_constants_.vertex_base_index = vgt_indx_offset;
+
+  // Index buffer endianness.
+  dirty |= system_constants_.vertex_index_endian != uint32_t(index_endian);
+  system_constants_.vertex_index_endian = uint32_t(index_endian);
 
   // Conversion to Direct3D 12 normalized device coordinates.
   // See viewport configuration in UpdateFixedFunctionState for explanations.
@@ -1464,13 +1492,35 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   system_constants_.pixel_half_pixel_offset = pixel_half_pixel_offset;
 
   // Point size.
-  float point_size[2];
-  point_size[0] = float(pa_su_point_size >> 16) * 0.125f;
-  point_size[1] = float(pa_su_point_size & 0xFFFF) * 0.125f;
-  dirty |= system_constants_.point_size[0] != point_size[0];
-  dirty |= system_constants_.point_size[1] != point_size[1];
-  system_constants_.point_size[0] = point_size[0];
-  system_constants_.point_size[1] = point_size[1];
+  float point_size_x = float(pa_su_point_size >> 16) * 0.125f;
+  float point_size_y = float(pa_su_point_size & 0xFFFF) * 0.125f;
+  float point_size_min = float(pa_su_point_minmax & 0xFFFF) * 0.125f;
+  float point_size_max = float(pa_su_point_minmax >> 16) * 0.125f;
+  dirty |= system_constants_.point_size[0] != point_size_x;
+  dirty |= system_constants_.point_size[1] != point_size_y;
+  dirty |= system_constants_.point_size_min_max[0] != point_size_min;
+  dirty |= system_constants_.point_size_min_max[1] != point_size_max;
+  system_constants_.point_size[0] = point_size_x;
+  system_constants_.point_size[1] = point_size_y;
+  system_constants_.point_size_min_max[0] = point_size_min;
+  system_constants_.point_size_min_max[1] = point_size_max;
+  float point_screen_to_ndc_x, point_screen_to_ndc_y;
+  if (pa_cl_vte_cntl & (1 << 0)) {
+    point_screen_to_ndc_x =
+        (viewport_scale_x != 0.0f) ? (0.5f / viewport_scale_x) : 0.0f;
+  } else {
+    point_screen_to_ndc_x = 1.0f / 2560.0f;
+  }
+  if (pa_cl_vte_cntl & (1 << 2)) {
+    point_screen_to_ndc_y =
+        (viewport_scale_y != 0.0f) ? (-0.5f / viewport_scale_y) : 0.0f;
+  } else {
+    point_screen_to_ndc_y = -1.0f / 2560.0f;
+  }
+  dirty |= system_constants_.point_screen_to_ndc[0] != point_screen_to_ndc_x;
+  dirty |= system_constants_.point_screen_to_ndc[1] != point_screen_to_ndc_y;
+  system_constants_.point_screen_to_ndc[0] = point_screen_to_ndc_x;
+  system_constants_.point_screen_to_ndc[1] = point_screen_to_ndc_y;
 
   // Pixel position register.
   uint32_t pixel_pos_reg =
