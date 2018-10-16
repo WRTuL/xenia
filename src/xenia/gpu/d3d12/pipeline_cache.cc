@@ -15,6 +15,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <utility>
 
 #include "xenia/base/assert.h"
 #include "xenia/base/logging.h"
@@ -36,15 +37,23 @@ namespace d3d12 {
 #include "xenia/gpu/d3d12/shaders/dxbc/primitive_rectangle_list_gs.h"
 
 PipelineCache::PipelineCache(D3D12CommandProcessor* command_processor,
-                             RegisterFile* register_file)
-    : command_processor_(command_processor), register_file_(register_file) {
-  shader_translator_ = std::make_unique<DxbcShaderTranslator>();
+                             RegisterFile* register_file, bool edram_rov_used)
+    : command_processor_(command_processor),
+      register_file_(register_file),
+      edram_rov_used_(edram_rov_used) {
+  shader_translator_ = std::make_unique<DxbcShaderTranslator>(edram_rov_used_);
+
+  if (edram_rov_used_) {
+    depth_only_pixel_shader_ =
+        std::move(shader_translator_->CreateDepthOnlyPixelShader());
+  }
 
   // Set pipeline state description values we never change.
   // Zero out tessellation, stream output, blend state and formats for render
   // targets 4+, node mask, cached PSO, flags and other things.
   std::memset(&update_desc_, 0, sizeof(update_desc_));
-  update_desc_.BlendState.IndependentBlendEnable = TRUE;
+  update_desc_.BlendState.IndependentBlendEnable =
+      edram_rov_used_ ? FALSE : TRUE;
   update_desc_.SampleMask = UINT_MAX;
   update_desc_.SampleDesc.Count = 1;
 }
@@ -322,8 +331,13 @@ PipelineCache::UpdateStatus PipelineCache::UpdateShaderStages(
     update_desc_.PS.pShaderBytecode = pixel_shader->translated_binary().data();
     update_desc_.PS.BytecodeLength = pixel_shader->translated_binary().size();
   } else {
-    update_desc_.PS.pShaderBytecode = nullptr;
-    update_desc_.PS.BytecodeLength = 0;
+    if (edram_rov_used_) {
+      update_desc_.PS.pShaderBytecode = depth_only_pixel_shader_.data();
+      update_desc_.PS.BytecodeLength = depth_only_pixel_shader_.size();
+    } else {
+      update_desc_.PS.pShaderBytecode = nullptr;
+      update_desc_.PS.BytecodeLength = 0;
+    }
   }
   switch (primitive_type) {
     case PrimitiveType::kPointList:
@@ -351,6 +365,11 @@ PipelineCache::UpdateStatus PipelineCache::UpdateShaderStages(
 PipelineCache::UpdateStatus PipelineCache::UpdateBlendStateAndRenderTargets(
     D3D12Shader* pixel_shader,
     const RenderTargetCache::PipelineRenderTarget render_targets[4]) {
+  if (edram_rov_used_) {
+    return current_pipeline_ == nullptr ? UpdateStatus::kMismatch
+                                        : UpdateStatus::kCompatible;
+  }
+
   auto& regs = update_blend_state_and_render_targets_regs_;
 
   bool dirty = current_pipeline_ == nullptr;
@@ -622,6 +641,11 @@ PipelineCache::UpdateStatus PipelineCache::UpdateRasterizerState(
 
 PipelineCache::UpdateStatus PipelineCache::UpdateDepthStencilState(
     DXGI_FORMAT format) {
+  if (edram_rov_used_) {
+    return current_pipeline_ == nullptr ? UpdateStatus::kMismatch
+                                        : UpdateStatus::kCompatible;
+  }
+
   auto& regs = update_depth_stencil_state_regs_;
 
   bool dirty = current_pipeline_ == nullptr;

@@ -143,14 +143,17 @@ bool ShaderTranslator::TranslateInternal(Shader* shader) {
 
   TranslateBlocks();
 
-  // Compute total bytes used by the register map.
-  // This saves us work later when we need to pack them.
+  // Compute total number of float registers and total bytes used by the
+  // register map. This saves us work later when we need to pack them.
   constant_register_map_.packed_byte_length = 0;
+  constant_register_map_.float_count = 0;
   for (int i = 0; i < 4; ++i) {
     // Each bit indicates a vec4 (4 floats).
-    constant_register_map_.packed_byte_length +=
-        4 * 4 * xe::bit_count(constant_register_map_.float_bitmap[i]);
+    constant_register_map_.float_count +=
+        xe::bit_count(constant_register_map_.float_bitmap[i]);
   }
+  constant_register_map_.packed_byte_length +=
+      4 * 4 * constant_register_map_.float_count;
   // Each bit indicates a single word.
   constant_register_map_.packed_byte_length +=
       4 * xe::bit_count(constant_register_map_.int_bitmap);
@@ -1303,9 +1306,16 @@ void ShaderTranslator::ParseAluVectorInstruction(
     // Track constant float register loads.
     if (i.operands[j].storage_source ==
         InstructionStorageSource::kConstantFloat) {
-      auto register_index = i.operands[j].storage_index;
-      constant_register_map_.float_bitmap[register_index / 64] |=
-          1ull << (register_index % 64);
+      if (i.operands[j].storage_addressing_mode !=
+          InstructionStorageAddressingMode::kStatic) {
+        // Dynamic addressing makes all constants required.
+        std::memset(constant_register_map_.float_bitmap, 0xFF,
+                    sizeof(constant_register_map_.float_bitmap));
+      } else {
+        auto register_index = i.operands[j].storage_index;
+        constant_register_map_.float_bitmap[register_index / 64] |=
+            1ull << (register_index % 64);
+      }
     }
   }
 
@@ -1436,14 +1446,25 @@ void ShaderTranslator::ParseAluScalarInstruction(
         op, InstructionStorageSource::kConstantFloat, op.src_reg(3),
         op.src_negate(3), 0, swiz_a, &i.operands[0]);
 
-    // Track constant float register loads.
-    auto register_index = i.operands[0].storage_index;
-    constant_register_map_.float_bitmap[register_index / 64] |=
-        1ull << (register_index % 64);
-
     ParseAluInstructionOperandSpecial(op, InstructionStorageSource::kRegister,
                                       reg2, op.src_negate(3), const_slot,
                                       swiz_b, &i.operands[1]);
+  }
+
+  // Track constant float register loads - in either case, a float constant may
+  // be used in operand 0.
+  if (i.operands[0].storage_source ==
+      InstructionStorageSource::kConstantFloat) {
+    auto register_index = i.operands[0].storage_index;
+    if (i.operands[0].storage_addressing_mode !=
+        InstructionStorageAddressingMode::kStatic) {
+      // Dynamic addressing makes all constants required.
+      std::memset(constant_register_map_.float_bitmap, 0xFF,
+                  sizeof(constant_register_map_.float_bitmap));
+    } else {
+      constant_register_map_.float_bitmap[register_index / 64] |=
+          1ull << (register_index % 64);
+    }
   }
 
   i.Disassemble(&ucode_disasm_buffer_);

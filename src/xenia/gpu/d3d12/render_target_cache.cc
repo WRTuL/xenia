@@ -9,6 +9,8 @@
 
 #include "xenia/gpu/d3d12/render_target_cache.h"
 
+#include <gflags/gflags.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -22,6 +24,10 @@
 #include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/texture_util.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
+
+DEFINE_bool(d3d12_rov, false,
+            "Use rasterizer-ordered views for render target emulation where "
+            "available (experimental and currently largely unimplemented).");
 
 namespace xe {
 namespace gpu {
@@ -330,6 +336,14 @@ void RenderTargetCache::ClearCache() {
   }
 }
 
+bool RenderTargetCache::IsROVUsedForEDRAM() const {
+  if (!FLAGS_d3d12_rov) {
+    return false;
+  }
+  auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();
+  return provider->AreRasterizerOrderedViewsSupported();
+}
+
 void RenderTargetCache::BeginFrame() {
   ClearBindings();
 
@@ -338,6 +352,10 @@ void RenderTargetCache::BeginFrame() {
 }
 
 bool RenderTargetCache::UpdateRenderTargets(const D3D12Shader* pixel_shader) {
+  if (IsROVUsedForEDRAM()) {
+    return true;
+  }
+
   // There are two kinds of render target binding updates in this implementation
   // in case something has been changed - full and partial.
   //
@@ -1090,10 +1108,7 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
         provider->OffsetViewDescriptor(descriptor_cpu_start, 1));
 
     // Transition the buffers.
-    command_processor_->PushTransitionBarrier(
-        edram_buffer_, edram_buffer_state_,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    edram_buffer_state_ = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    TransitionEDRAMBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     shared_memory->UseForWriting();
     command_processor_->SubmitBarriers();
 
@@ -1224,10 +1239,7 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
 
     // Load the EDRAM buffer contents to the copy buffer.
 
-    command_processor_->PushTransitionBarrier(
-        edram_buffer_, edram_buffer_state_,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    edram_buffer_state_ = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    TransitionEDRAMBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     command_processor_->SubmitBarriers();
 
     command_list->SetComputeRootSignature(edram_load_store_root_signature_);
@@ -1493,10 +1505,7 @@ bool RenderTargetCache::ResolveClear(uint32_t edram_base,
   }
 
   // Submit the clear.
-  command_processor_->PushTransitionBarrier(
-      edram_buffer_, edram_buffer_state_,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  edram_buffer_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  TransitionEDRAMBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
   command_processor_->SubmitBarriers();
   EDRAMLoadStoreRootConstants root_constants;
   root_constants.clear_rect_lt = (clear_rect.left << samples_x_log2) |
@@ -1710,6 +1719,25 @@ void RenderTargetCache::UnbindRenderTargets() {
   ClearBindings();
 }
 
+void RenderTargetCache::UseEDRAMAsUAV() {
+  TransitionEDRAMBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+void RenderTargetCache::CreateEDRAMUint32UAV(
+    D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+  auto device =
+      command_processor_->GetD3D12Context()->GetD3D12Provider()->GetDevice();
+  D3D12_UNORDERED_ACCESS_VIEW_DESC desc;
+  desc.Format = DXGI_FORMAT_R32_UINT;
+  desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+  desc.Buffer.FirstElement = 0;
+  desc.Buffer.NumElements = kEDRAMBufferSize / sizeof(uint32_t);
+  desc.Buffer.StructureByteStride = 0;
+  desc.Buffer.CounterOffsetInBytes = 0;
+  desc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+  device->CreateUnorderedAccessView(edram_buffer_, nullptr, &desc, handle);
+}
+
 void RenderTargetCache::EndFrame() { UnbindRenderTargets(); }
 
 ColorRenderTargetFormat RenderTargetCache::GetBaseColorFormat(
@@ -1740,11 +1768,9 @@ DXGI_FORMAT RenderTargetCache::GetColorDXGIFormat(
     case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
       return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case ColorRenderTargetFormat::k_16_16:
-      // TODO(Triang3l): Change to SNORM when signed textures are supported.
-      return DXGI_FORMAT_R16G16_UNORM;
+      return DXGI_FORMAT_R16G16_SNORM;
     case ColorRenderTargetFormat::k_16_16_16_16:
-      // TODO(Triang3l): Change to SNORM when signed textures are supported.
-      return DXGI_FORMAT_R16G16B16A16_UNORM;
+      return DXGI_FORMAT_R16G16B16A16_SNORM;
     case ColorRenderTargetFormat::k_16_16_FLOAT:
       return DXGI_FORMAT_R16G16_FLOAT;
     case ColorRenderTargetFormat::k_32_FLOAT:
@@ -1755,6 +1781,12 @@ DXGI_FORMAT RenderTargetCache::GetColorDXGIFormat(
       break;
   }
   return DXGI_FORMAT_UNKNOWN;
+}
+
+void RenderTargetCache::TransitionEDRAMBuffer(D3D12_RESOURCE_STATES new_state) {
+  command_processor_->PushTransitionBarrier(edram_buffer_, edram_buffer_state_,
+                                            new_state);
+  edram_buffer_state_ = new_state;
 }
 
 void RenderTargetCache::ClearBindings() {
@@ -2079,10 +2111,7 @@ void RenderTargetCache::StoreRenderTargetsToEDRAM() {
                                               D3D12_RESOURCE_STATE_COPY_SOURCE);
     render_target->state = D3D12_RESOURCE_STATE_COPY_SOURCE;
   }
-  command_processor_->PushTransitionBarrier(
-      edram_buffer_, edram_buffer_state_,
-      D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-  edram_buffer_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  TransitionEDRAMBuffer(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
   // Set up the bindings.
   auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();
@@ -2237,10 +2266,7 @@ void RenderTargetCache::LoadRenderTargetsFromEDRAM(
                                               D3D12_RESOURCE_STATE_COPY_DEST);
     render_target->state = D3D12_RESOURCE_STATE_COPY_DEST;
   }
-  command_processor_->PushTransitionBarrier(
-      edram_buffer_, edram_buffer_state_,
-      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-  edram_buffer_state_ = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  TransitionEDRAMBuffer(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
   // Set up the bindings.
   auto provider = command_processor_->GetD3D12Context()->GetD3D12Provider();

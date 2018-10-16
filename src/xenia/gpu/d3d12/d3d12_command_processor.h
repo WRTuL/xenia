@@ -10,6 +10,7 @@
 #ifndef XENIA_GPU_D3D12_D3D12_COMMAND_PROCESSOR_H_
 #define XENIA_GPU_D3D12_D3D12_COMMAND_PROCESSOR_H_
 
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <unordered_map>
@@ -39,6 +40,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   ~D3D12CommandProcessor();
 
   void ClearCaches() override;
+
+  void RequestFrameTrace(const std::wstring& root_path) override;
 
   // Needed by everything that owns transient objects.
   xe::ui::d3d12::D3D12Context* GetD3D12Context() const {
@@ -142,37 +145,38 @@ class D3D12CommandProcessor : public CommandProcessor {
     // These are always present.
 
     // Very frequently changed, especially for UI draws, and for models drawn in
-    // multiple parts - contains vertex and texture fetch constants (b2).
+    // multiple parts - contains vertex and texture fetch constants.
     kRootParameter_FetchConstants,
     // Quite frequently changed (for one object drawn multiple times, for
-    // instance - may contain projection matrices) - 8 pages of float constants
-    // (b3-b10).
-    kRootParameter_VertexFloatConstants,
-    // Less frequently changed (per-material) - 8 pages of float constants
-    // (b3-b10).
-    kRootParameter_PixelFloatConstants,
-    // Rarely changed - system constants like viewport and alpha testing (b0)
-    // and loop and bool constants (b1).
-    kRootParameter_CommonConstants,
-    // Never changed - shared memory byte address buffer (t0, space1).
-    kRootParameter_SharedMemory,
+    // instance - may contain projection matrices).
+    kRootParameter_FloatConstantsVertex,
+    // Less frequently changed (per-material).
+    kRootParameter_FloatConstantsPixel,
+    // Rarely changed - system constants like viewport and alpha testing.
+    kRootParameter_SystemConstants,
+    // Pretty rarely used and rarely changed - flow control constants.
+    kRootParameter_BoolLoopConstants,
+    // Never changed except for when starting a new descriptor heap - shared
+    // memory byte address buffer (t0) and, if ROV is used for EDRAM, EDRAM UAV
+    // (u0).
+    kRootParameter_SharedMemoryAndEDRAM,
 
     kRootParameter_Count_Base,
 
     // Extra parameter that may or may not exist:
-    // - Pixel textures.
-    // - Pixel samplers.
-    // - Vertex textures.
-    // - Vertex samplers.
+    // - Pixel textures (t1+).
+    // - Pixel samplers (s0+).
+    // - Vertex textures (t1+).
+    // - Vertex samplers (s0+).
 
     kRootParameter_Count_Max = kRootParameter_Count_Base + 4,
   };
 
   struct RootExtraParameterIndices {
-    uint32_t pixel_textures;
-    uint32_t pixel_samplers;
-    uint32_t vertex_textures;
-    uint32_t vertex_samplers;
+    uint32_t textures_pixel;
+    uint32_t samplers_pixel;
+    uint32_t textures_vertex;
+    uint32_t samplers_vertex;
     static constexpr uint32_t kUnavailable = UINT32_MAX;
   };
   // Gets the indices of optional root parameters. Returns the total parameter
@@ -217,6 +221,17 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::unique_ptr<ui::d3d12::DescriptorHeapPool> view_heap_pool_ = nullptr;
   std::unique_ptr<ui::d3d12::DescriptorHeapPool> sampler_heap_pool_ = nullptr;
 
+  // Mip 0 contains the normal gamma ramp (256 entries), mip 1 contains the PWL
+  // ramp (128 entries). DXGI_FORMAT_R10G10B10A2_UNORM 1D.
+  ID3D12Resource* gamma_ramp_texture_ = nullptr;
+  D3D12_RESOURCE_STATES gamma_ramp_texture_state_;
+  // Upload buffer for an image that is the same as gamma_ramp_, but with
+  // ui::d3d12::D3D12Context::kQueuedFrames array layers.
+  ID3D12Resource* gamma_ramp_upload_ = nullptr;
+  uint8_t* gamma_ramp_upload_mapping_ = nullptr;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT
+  gamma_ramp_footprints_[ui::d3d12::D3D12Context::kQueuedFrames * 2];
+
   static constexpr uint32_t kSwapTextureWidth = 1280;
   static constexpr uint32_t kSwapTextureHeight = 720;
   ID3D12Resource* swap_texture_ = nullptr;
@@ -240,6 +255,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool scratch_buffer_used_ = false;
 
   uint32_t current_queue_frame_ = UINT32_MAX;
+
+  std::atomic<bool> pix_capture_requested_ = false;
+  bool pix_capturing_;
 
   // The current fixed-function drawing state.
   D3D12_VIEWPORT ff_viewport_;
@@ -270,6 +288,11 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // System shader constants.
   DxbcShaderTranslator::SystemConstants system_constants_;
+  ColorRenderTargetFormat system_constants_color_formats_[4];
+
+  // Float constant usage masks of the last draw call.
+  uint64_t current_float_constant_map_vertex_[4];
+  uint64_t current_float_constant_map_pixel_[4];
 
   // Constant buffer bindings.
   struct ConstantBufferBinding {
@@ -277,7 +300,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     bool up_to_date;
   };
   ConstantBufferBinding cbuffer_bindings_system_;
-  ConstantBufferBinding cbuffer_bindings_float_[16];
+  ConstantBufferBinding cbuffer_bindings_float_vertex_;
+  ConstantBufferBinding cbuffer_bindings_float_pixel_;
   ConstantBufferBinding cbuffer_bindings_bool_loop_;
   ConstantBufferBinding cbuffer_bindings_fetch_;
 
@@ -285,16 +309,37 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t draw_view_full_update_;
   uint64_t draw_sampler_full_update_;
 
+  // Whether the last used texture bindings have been written to the current
+  // view descriptor heap.
+  bool texture_bindings_written_vertex_;
+  bool texture_bindings_written_pixel_;
+  // Hashes of the last texture bindings written to the current view descriptor
+  // heap with the last used descriptor layout. Valid only when the
+  // corresponding "written" variables are true.
+  uint64_t current_texture_bindings_hash_vertex_;
+  uint64_t current_texture_bindings_hash_pixel_;
+
+  // Whether the last used samplers have been written to the current sampler
+  // descriptor heap.
+  bool samplers_written_vertex_;
+  bool samplers_written_pixel_;
+  // Hashes of the last sampler parameters written to the current sampler
+  // descriptor heap with the last used descriptor layout. Valid only when the
+  // corresponding "written" variables are true.
+  uint64_t current_samplers_hash_vertex_;
+  uint64_t current_samplers_hash_pixel_;
+
   // Latest descriptor handles used for handling Xenos draw calls.
-  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_common_constants_;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_system_constants_;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_float_constants_vertex_;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_float_constants_pixel_;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_bool_loop_constants_;
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_fetch_constants_;
-  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_vertex_float_constants_;
-  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_pixel_float_constants_;
-  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory_;
-  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_pixel_textures_;
-  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_pixel_samplers_;
-  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_vertex_textures_;
-  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_vertex_samplers_;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_shared_memory_and_edram_;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_textures_vertex_;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_textures_pixel_;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_samplers_vertex_;
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle_samplers_pixel_;
 
   // Current primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology_;

@@ -30,6 +30,10 @@ class D3D12Provider : public GraphicsProvider {
   std::unique_ptr<GraphicsContext> CreateOffscreenContext() override;
 
   IDXGIFactory2* GetDXGIFactory() const { return dxgi_factory_; }
+  // nullptr if PIX not attached.
+  IDXGraphicsAnalysis* GetGraphicsAnalysis() const {
+    return graphics_analysis_;
+  }
   ID3D12Device* GetDevice() const { return device_; }
   ID3D12CommandQueue* GetDirectQueue() const { return direct_queue_; }
 
@@ -58,6 +62,10 @@ class D3D12Provider : public GraphicsProvider {
     return start;
   }
 
+  bool AreRasterizerOrderedViewsSupported() const {
+    return rasterizer_ordered_views_supported_;
+  }
+  uint32_t GetTiledResourcesTier() const { return tiled_resources_tier_; }
   uint32_t GetProgrammableSamplePositionsTier() const {
     return programmable_sample_positions_tier_;
   }
@@ -66,9 +74,9 @@ class D3D12Provider : public GraphicsProvider {
   explicit D3D12Provider(Window* main_window);
 
   bool Initialize();
-  static bool IsDeviceSupported(ID3D12Device* device);
 
   IDXGIFactory2* dxgi_factory_ = nullptr;
+  IDXGraphicsAnalysis* graphics_analysis_ = nullptr;
   ID3D12Device* device_ = nullptr;
   ID3D12CommandQueue* direct_queue_ = nullptr;
 
@@ -77,6 +85,8 @@ class D3D12Provider : public GraphicsProvider {
   uint32_t descriptor_size_rtv_;
   uint32_t descriptor_size_dsv_;
 
+  bool rasterizer_ordered_views_supported_;
+  uint32_t tiled_resources_tier_;
   uint32_t programmable_sample_positions_tier_;
 };
 
