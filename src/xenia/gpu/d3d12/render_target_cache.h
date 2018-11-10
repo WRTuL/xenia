@@ -240,11 +240,6 @@ class RenderTargetCache {
   void Shutdown();
   void ClearCache();
 
-  // Should a rasterizer-ordered UAV of the EDRAM buffer with format conversion
-  // and blending performed in pixel shaders be used instead of host render
-  // targets.
-  bool IsROVUsedForEDRAM() const;
-
   void BeginFrame();
   // Called in the beginning of a draw call - may bind pipelines.
   bool UpdateRenderTargets(const D3D12Shader* pixel_shader);
@@ -395,6 +390,8 @@ class RenderTargetCache {
     uint32_t copy_buffer_size;
   };
 
+  uint32_t GetEDRAMBufferSize() const;
+
   void TransitionEDRAMBuffer(D3D12_RESOURCE_STATES new_state);
 
   void ClearBindings();
@@ -446,7 +443,7 @@ class RenderTargetCache {
   bool ResolveCopy(SharedMemory* shared_memory, TextureCache* texture_cache,
                    uint32_t edram_base, uint32_t surface_pitch,
                    MsaaSamples msaa_samples, bool is_depth, uint32_t src_format,
-                   const D3D12_RECT& src_rect);
+                   const D3D12_RECT& rect);
   // Performs the clearing part of a resolve.
   bool ResolveClear(uint32_t edram_base, uint32_t surface_pitch,
                     MsaaSamples msaa_samples, bool is_depth, uint32_t format,
@@ -465,10 +462,6 @@ class RenderTargetCache {
 
   // The EDRAM buffer allowing color and depth data to be reinterpreted.
   ID3D12Resource* edram_buffer_ = nullptr;
-  // Two 10 MB pages, one containing color and integer depth data, another with
-  // 32-bit float depth when 20e4 depth is used to allow for multipass drawing
-  // without precision loss in case of EDRAM store/load.
-  static constexpr uint32_t kEDRAMBufferSize = 2 * 2048 * 5120;
   D3D12_RESOURCE_STATES edram_buffer_state_;
   bool edram_buffer_cleared_;
 
@@ -484,9 +477,11 @@ class RenderTargetCache {
         uint32_t rt_stencil_pitch;
       };
       struct {
-        // 16 bits for X, 16 bits for Y.
-        uint32_t tile_sample_rect_lt;
-        uint32_t tile_sample_rect_rb;
+        // 0:11 - resolve area width/height in pixels.
+        // 12:16 - offset in the destination texture (only up to 31 - assuming
+        //         32*n is pre-applied to the base pointer).
+        // 17: - left/top of the copied region (relative to EDRAM base).
+        uint32_t tile_sample_dimensions[2];
         uint32_t tile_sample_dest_base;
         // 0:13 - destination pitch.
         // 14 - log2(vertical sample count), 0 for 1x AA, 1 for 2x/4x AA.

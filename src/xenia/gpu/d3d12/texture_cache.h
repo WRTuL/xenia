@@ -131,6 +131,7 @@ class TextureCache {
   // The source buffer must be in the non-pixel-shader SRV state.
   bool TileResolvedTexture(TextureFormat format, uint32_t texture_base,
                            uint32_t texture_pitch, uint32_t texture_height,
+                           uint32_t offset_x, uint32_t offset_y,
                            uint32_t resolve_width, uint32_t resolve_height,
                            Endian128 endian, ID3D12Resource* buffer,
                            uint32_t buffer_size,
@@ -176,6 +177,7 @@ class TextureCache {
     k16bpp,
     k32bpp,
     k64bpp,
+    k128bpp,
     // B5G5R5A1 and B4G4R4A4 are optional in DXGI for render targets, and aren't
     // supported on Nvidia.
     k16bppRGBA,
@@ -290,18 +292,19 @@ class TextureCache {
     TextureKey key;
     ID3D12Resource* resource;
     D3D12_RESOURCE_STATES state;
-    // Byte size of one array slice of the top guest mip level.
-    uint32_t base_slice_size;
+
     // Byte size of the top guest mip level.
     uint32_t base_size;
-    // Byte size of one array slice of mips between 1 and key.mip_max_level.
-    uint32_t mip_slice_size;
-    // Byte size of mips between 1 and key.mip_max_level.
+    // Byte size of mips between 1 and key.mip_max_level, containing all array
+    // slices.
     uint32_t mip_size;
-    // Byte offsets of each mipmap within one slice.
+    // Offsets of all the array slices on a mip level relative to mips_address
+    // (0 for mip 0, it's relative to base_address then, and for mip 1).
     uint32_t mip_offsets[14];
-    // Byte pitches of each mipmap within one slice (for linear layout mainly).
-    uint32_t mip_pitches[14];
+    // Byte sizes of an array slice on each mip level.
+    uint32_t slice_sizes[14];
+    // Row pitches on each mip level (for linear layout mainly).
+    uint32_t pitches[14];
 
     // Watch handles for the memory ranges (protected by the shared memory watch
     // mutex).
@@ -353,6 +356,9 @@ class TextureCache {
     // 3:8 - guest format (primarily for 16-bit textures).
     // 9:31 - actual guest texture width.
     uint32_t endian_format_guest_pitch;
+    // Origin of the written data in the destination texture. X in the lower 16
+    // bits, Y in the upper.
+    uint32_t offset;
     // Size to copy, texels with index bigger than this won't be written.
     // Width in the lower 16 bits, height in the upper.
     uint32_t size;
