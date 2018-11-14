@@ -147,6 +147,10 @@ class TextureCache {
     k32bpb,
     k64bpb,
     k128bpb,
+    kR11G11B10ToRGBA16,
+    kR11G11B10ToRGBA16SNorm,
+    kR10G11B11ToRGBA16,
+    kR10G11B11ToRGBA16SNorm,
     kDXT1ToRGBA8,
     kDXT3ToRGBA8,
     kDXT5ToRGBA8,
@@ -165,9 +169,6 @@ class TextureCache {
   struct LoadModeInfo {
     const void* shader;
     size_t shader_size;
-    // TODO(Triang3l): Whether signed and integer textures need to be separate
-    // resources loaded differently than unorm textures (k_10_11_11,
-    // k_11_11_10 because they are expanded to R16G16B16A16).
   };
 
   // Tiling modes for storing textures after resolving - needed only for the
@@ -181,6 +182,8 @@ class TextureCache {
     // B5G5R5A1 and B4G4R4A4 are optional in DXGI for render targets, and aren't
     // supported on Nvidia.
     k16bppRGBA,
+    kR11G11B10AsRGBA16,
+    kR10G11B11AsRGBA16,
 
     kCount,
 
@@ -204,11 +207,22 @@ class TextureCache {
     DXGI_FORMAT dxgi_format_resource;
     // DXGI format for unsigned normalized or unsigned/signed float SRV.
     DXGI_FORMAT dxgi_format_unorm;
+    // The regular load mode, used when special modes (like signed-specific or
+    // decompressing) aren't needed.
+    LoadMode load_mode;
     // DXGI format for signed normalized or unsigned/signed float SRV.
     DXGI_FORMAT dxgi_format_snorm;
-    LoadMode load_mode;
+    // If the signed version needs a different bit representation on the host,
+    // this is the load mode for the signed version. Otherwise the regular
+    // load_mode will be used for the signed version, and a single copy will be
+    // created if both unsigned and signed are used.
+    LoadMode load_mode_snorm;
 
-    // TODO(Triang3l): Integer formats.
+    // Do NOT add integer DXGI formats to this - they are not filterable, can
+    // only be read with Load, not Sample! If any game is seen using num_format
+    // 1 for fixed-point formats (for floating-point, it's normally set to 1
+    // though), add a constant buffer containing multipliers for the
+    // textures and multiplication to the tfetch implementation.
 
     // Uncompression info for when the regular host format for this texture is
     // block-compressed, but the size is not block-aligned, and thus such
@@ -245,6 +259,9 @@ class TextureCache {
       uint32_t mip_max_level : 4;  // 78
       TextureFormat format : 6;    // 84
       Endian endianness : 2;       // 86
+      // Whether this texture is signed and has a different host representation
+      // than an unsigned view of the same guest texture.
+      uint32_t signed_separate : 1;  // 87
     };
     struct {
       // The key used for unordered_multimap lookup. Single uint32_t instead of
@@ -277,7 +294,7 @@ class TextureCache {
       map_key[0] = uint32_t(key);
       map_key[1] = uint32_t(key >> 32);
     }
-    inline bool IsInvalid() {
+    inline bool IsInvalid() const {
       // Zero base and zero width is enough for a binding to be invalid.
       return map_key[0] == 0;
     }
@@ -375,9 +392,21 @@ class TextureCache {
     bool has_unsigned;
     // Whether the fetch has signed components.
     bool has_signed;
+    // Unsigned version of the texture (or signed if they have the same data).
     Texture* texture;
+    // Signed version of the texture if the data in the signed version is
+    // different on the host.
+    Texture* texture_signed;
   };
 
+  // Whether the signed version of the texture has a different representation on
+  // the host than its unsigned version (for example, if it's a fixed-point
+  // texture emulated with a larger host pixel format).
+  static inline bool IsSignedVersionSeparate(TextureFormat format) {
+    const HostFormat& host_format = host_formats_[uint32_t(format)];
+    return host_format.load_mode_snorm != LoadMode::kUnknown &&
+           host_format.load_mode_snorm != host_format.load_mode;
+  }
   // Whether decompression is needed on the host (Direct3D only allows creation
   // of block-compressed textures with 4x4-aligned dimensions on PC).
   static bool IsDecompressionNeeded(TextureFormat format, uint32_t width,
