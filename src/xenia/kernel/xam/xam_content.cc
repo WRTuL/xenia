@@ -38,7 +38,7 @@ dword_result_t XamContentGetLicenseMask(lpdword_t mask_ptr,
   // Each bit in the mask represents a granted license. Available licenses
   // seems to vary from game to game, but most appear to use bit 0 to indicate
   // if the game is purchased or not.
-  *mask_ptr = 0;
+  *mask_ptr = 1;
 
   if (overlapped_ptr) {
     kernel_state()->CompleteOverlappedImmediate(overlapped_ptr,
@@ -255,7 +255,7 @@ dword_result_t XamContentCreateEx(dword_t user_index, lpstring_t root_name,
   }
 
   if (license_mask_ptr && XSUCCEEDED(result)) {
-    *license_mask_ptr = 0;  // Stub!
+    *license_mask_ptr = 1;  // Stub!
   }
 
   if (overlapped_ptr) {
