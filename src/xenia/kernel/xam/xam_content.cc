@@ -30,7 +30,7 @@ static const DeviceInfo dummy_device_info_ = {
     1,
     120ull * 1024ull * 1024ull * 1024ull,  // 120GB
     100ull * 1024ull * 1024ull * 1024ull,  // 100GB, so it looks a little used.
-    L"Ravioli HDD,
+    L"Ravioli HDD",
 };
 
 dword_result_t XamContentGetLicenseMask(lpdword_t mask_ptr,
