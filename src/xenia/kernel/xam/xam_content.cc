@@ -23,15 +23,26 @@ struct DeviceInfo {
   uint32_t device_type;
   uint64_t total_bytes;
   uint64_t free_bytes;
-  std::wstring name;
+  wchar_t name[28];
 };
+
+// TODO(gibbed): real information.
+//
+// Until we expose real information about a HDD device, we
+// claim there is 3GB free on a 4GB dummy HDD.
+//
+// There is a possibility that certain games are bugged in that
+// they incorrectly only look at the lower 32-bits of free_bytes,
+// when it is a 64-bit value. Which means any size above ~4GB
+// will not be recognized properly.
+#define ONE_GB (1024ull * 1024ull * 1024ull)
 static const DeviceInfo dummy_device_info_ = {
-    0xF00D0000,
-    1,
-    120ull * 1024ull * 1024ull * 1024ull,  // 120GB
-    100ull * 1024ull * 1024ull * 1024ull,  // 100GB, so it looks a little used.
+    0xF00D0000,    1,
+    4ull * ONE_GB,  // 4GB
+    3ull * ONE_GB,  // 3GB, so it looks a little used.
     L"Dummy HDD",
 };
+#undef ONE_GB
 
 dword_result_t XamContentGetLicenseMask(lpdword_t mask_ptr,
                                         lpunknown_t overlapped_ptr) {
@@ -57,11 +68,13 @@ dword_result_t XamContentGetDeviceName(dword_t device_id,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  if (name_capacity < dummy_device_info_.name.size() + 1) {
+  auto name = std::wstring(dummy_device_info_.name);
+  if (name_capacity < name.size() + 1) {
     return X_ERROR_INSUFFICIENT_BUFFER;
   }
 
-  xe::store_and_swap<std::wstring>(name_buffer, dummy_device_info_.name);
+  xe::store_and_swap<std::wstring>(name_buffer, name);
+  ((wchar_t*)name_buffer)[name.size()] = 0;
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamContentGetDeviceName, kContent, kImplemented);
@@ -96,6 +109,7 @@ typedef struct {
   xe::be<uint64_t> free_bytes;
   xe::be<uint16_t> name[28];
 } X_CONTENT_DEVICE_DATA;
+static_assert_size(X_CONTENT_DEVICE_DATA, 0x50);
 
 dword_result_t XamContentGetDeviceData(
     dword_t device_id, pointer_t<X_CONTENT_DEVICE_DATA> device_data) {
@@ -104,6 +118,7 @@ dword_result_t XamContentGetDeviceData(
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  device_data.Zero();
   const auto& device_info = dummy_device_info_;
   device_data->device_id = device_info.device_id;
   device_data->unknown = device_id & 0xFFFF;  // Fake it.
@@ -173,6 +188,35 @@ dword_result_t XamContentCreateEnumerator(dword_t user_index, dword_t device_id,
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamContentCreateEnumerator, kContent, kImplemented);
+
+dword_result_t XamContentCreateDeviceEnumerator(dword_t content_type,
+                                                dword_t content_flags,
+                                                dword_t max_count,
+                                                lpdword_t buffer_size_ptr,
+                                                lpdword_t handle_out) {
+  assert_not_null(handle_out);
+
+  if (buffer_size_ptr) {
+    *buffer_size_ptr = sizeof(DeviceInfo) * max_count;
+  }
+
+  auto e = new XStaticEnumerator(kernel_state(), max_count, sizeof(DeviceInfo));
+  e->Initialize();
+
+  // Copy our dummy device into the enumerator
+  DeviceInfo* dev = (DeviceInfo*)e->AppendItem();
+  if (dev) {
+    xe::store_and_swap(&dev->device_id, dummy_device_info_.device_id);
+    xe::store_and_swap(&dev->device_type, dummy_device_info_.device_type);
+    xe::store_and_swap(&dev->total_bytes, dummy_device_info_.total_bytes);
+    xe::store_and_swap(&dev->free_bytes, dummy_device_info_.free_bytes);
+    xe::copy_and_swap(dev->name, dummy_device_info_.name, 28);
+  }
+
+  *handle_out = e->handle();
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamContentCreateDeviceEnumerator, kNone, kImplemented);
 
 dword_result_t XamContentCreateEx(dword_t user_index, lpstring_t root_name,
                                   lpvoid_t content_data_ptr, dword_t flags,

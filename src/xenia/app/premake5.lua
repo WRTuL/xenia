@@ -15,6 +15,7 @@ project("xenia-app")
     "imgui",
     "libavcodec",
     "libavutil",
+    "mspack",
     "snappy",
     "spirv-tools",
     "volk",
@@ -41,6 +42,8 @@ project("xenia-app")
     "WinMain",  -- Use WinMain instead of main.
   })
   defines({
+    "XBYAK_NO_OP_NAMES",
+    "XBYAK_ENABLE_OMITTED_OPERAND",
   })
   includedirs({
     project_root.."/third_party/gflags/src",

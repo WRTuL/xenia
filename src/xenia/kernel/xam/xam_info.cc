@@ -17,12 +17,167 @@
 #include "xenia/kernel/xthread.h"
 #include "xenia/xbox.h"
 
+#if XE_PLATFORM_WIN32
+#include "xenia/base/platform_win.h"
+#endif
+
 namespace xe {
 namespace kernel {
 namespace xam {
 
 constexpr uint32_t X_LANGUAGE_ENGLISH = 1;
 constexpr uint32_t X_LANGUAGE_JAPANESE = 2;
+
+dword_result_t XamFeatureEnabled(dword_t unk) { return 0; }
+DECLARE_XAM_EXPORT1(XamFeatureEnabled, kNone, kStub);
+
+// Empty stub schema binary.
+uint8_t schema_bin[] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00,
+    0x00, 0x2C, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2C, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18,
+};
+
+dword_result_t XamGetOnlineSchema() {
+  static uint32_t schema_guest = 0;
+
+  if (!schema_guest) {
+    schema_guest =
+        kernel_state()->memory()->SystemHeapAlloc(8 + sizeof(schema_bin));
+    auto schema = kernel_state()->memory()->TranslateVirtual(schema_guest);
+    std::memcpy(schema + 8, schema_bin, sizeof(schema_bin));
+    xe::store_and_swap<uint32_t>(schema + 0, schema_guest + 8);
+    xe::store_and_swap<uint32_t>(schema + 4, sizeof(schema_bin));
+  }
+
+  // return pointer to the schema ptr/schema size struct
+  return schema_guest;
+}
+DECLARE_XAM_EXPORT1(XamGetOnlineSchema, kNone, kImplemented);
+
+void XamFormatDateString(dword_t unk, qword_t filetime, lpvoid_t buffer,
+                         dword_t buffer_length) {
+  std::memset(buffer, 0, buffer_length * 2);
+
+// TODO: implement this for other platforms
+#if XE_PLATFORM_WIN32
+  FILETIME t;
+  t.dwHighDateTime = filetime >> 32;
+  t.dwLowDateTime = (uint32_t)filetime;
+
+  SYSTEMTIME st;
+  SYSTEMTIME stLocal;
+
+  FileTimeToSystemTime(&t, &st);
+  SystemTimeToTzSpecificLocalTime(NULL, &st, &stLocal);
+
+  wchar_t buf[256];
+  // TODO: format this depending on users locale?
+  swprintf(buf, 256, L"%02d/%02d/%d", stLocal.wMonth, stLocal.wDay,
+           stLocal.wYear);
+
+  xe::copy_and_swap((wchar_t*)buffer.host_address(), buf, buffer_length);
+#else
+  assert_always();
+#endif
+}
+DECLARE_XAM_EXPORT1(XamFormatDateString, kNone, kImplemented);
+
+void XamFormatTimeString(dword_t unk, qword_t filetime, lpvoid_t buffer,
+                         dword_t buffer_length) {
+  std::memset(buffer, 0, buffer_length * 2);
+
+// TODO: implement this for other platforms
+#if XE_PLATFORM_WIN32
+  FILETIME t;
+  t.dwHighDateTime = filetime >> 32;
+  t.dwLowDateTime = (uint32_t)filetime;
+
+  SYSTEMTIME st;
+  SYSTEMTIME stLocal;
+
+  FileTimeToSystemTime(&t, &st);
+  SystemTimeToTzSpecificLocalTime(NULL, &st, &stLocal);
+
+  wchar_t buf[256];
+  swprintf(buf, 256, L"%02d:%02d", stLocal.wHour, stLocal.wMinute);
+
+  xe::copy_and_swap((wchar_t*)buffer.host_address(), buf, buffer_length);
+#else
+  assert_always();
+#endif
+}
+DECLARE_XAM_EXPORT1(XamFormatTimeString, kNone, kImplemented);
+
+dword_result_t keXamBuildResourceLocator(uint64_t module,
+                                         const wchar_t* container,
+                                         const wchar_t* resource,
+                                         lpvoid_t buffer,
+                                         uint32_t buffer_length) {
+  wchar_t buf[256];
+
+  if (!module) {
+    swprintf(buf, 256, L"file://media:/%s.xzp#%s", container, resource);
+    XELOGD(
+        "XamBuildResourceLocator(%ws) returning locator to local file %ws.xzp",
+        container, container);
+  } else {
+    swprintf(buf, 256, L"section://%X,%s#%s", (uint32_t)module, container,
+             resource);
+  }
+
+  xe::copy_and_swap((wchar_t*)buffer.host_address(), buf, buffer_length);
+  return 0;
+}
+
+dword_result_t XamBuildResourceLocator(qword_t module, lpwstring_t container,
+                                       lpwstring_t resource, lpvoid_t buffer,
+                                       dword_t buffer_length) {
+  return keXamBuildResourceLocator(module, container.value().c_str(),
+                                   resource.value().c_str(), buffer,
+                                   buffer_length);
+}
+DECLARE_XAM_EXPORT1(XamBuildResourceLocator, kNone, kImplemented);
+
+dword_result_t XamBuildGamercardResourceLocator(lpwstring_t filename,
+                                                lpvoid_t buffer,
+                                                dword_t buffer_length) {
+  // On an actual xbox these funcs would return a locator to xam.xex resources,
+  // but for Xenia we can return a locator to the resources as local files. (big
+  // thanks to MS for letting XamBuildResourceLocator return local file
+  // locators!)
+
+  // If you're running an app that'll need them, make sure to extract xam.xex
+  // resources with xextool ("xextool -d . xam.xex") and add a .xzp extension.
+
+  return keXamBuildResourceLocator(0, L"gamercrd", filename.value().c_str(),
+                                   buffer, buffer_length);
+}
+DECLARE_XAM_EXPORT1(XamBuildGamercardResourceLocator, kNone, kImplemented);
+
+dword_result_t XamBuildSharedSystemResourceLocator(lpwstring_t filename,
+                                                   lpvoid_t buffer,
+                                                   dword_t buffer_length) {
+  // see notes inside XamBuildGamercardResourceLocator above
+  return keXamBuildResourceLocator(0, L"shrdres", filename.value().c_str(),
+                                   buffer, buffer_length);
+}
+DECLARE_XAM_EXPORT1(XamBuildSharedSystemResourceLocator, kNone, kImplemented);
+
+dword_result_t XamBuildLegacySystemResourceLocator(lpwstring_t filename,
+                                                   lpvoid_t buffer,
+                                                   dword_t buffer_length) {
+  return XamBuildSharedSystemResourceLocator(filename, buffer, buffer_length);
+}
+DECLARE_XAM_EXPORT1(XamBuildLegacySystemResourceLocator, kNone, kImplemented);
+
+dword_result_t XamBuildXamResourceLocator(lpwstring_t filename, lpvoid_t buffer,
+                                          dword_t buffer_length) {
+  return keXamBuildResourceLocator(0, L"xam", filename.value().c_str(), buffer,
+                                   buffer_length);
+}
+DECLARE_XAM_EXPORT1(XamBuildXamResourceLocator, kNone, kImplemented);
 
 dword_result_t XamGetSystemVersion() {
   // eh, just picking one. If we go too low we may break new games, but
@@ -232,8 +387,6 @@ dword_result_t XamEnumerate(dword_t handle, dword_t flags, lpvoid_t buffer,
     result = X_ERROR_SUCCESS;
   }
 
-  // Return X_ERROR_NO_MORE_FILES in HRESULT form.
-  X_HRESULT extended_result = result != 0 ? X_HRESULT_FROM_WIN32(result) : 0;
   if (items_returned) {
     assert_true(!overlapped);
     *items_returned = result == X_ERROR_SUCCESS ? item_count : 0;
@@ -241,7 +394,9 @@ dword_result_t XamEnumerate(dword_t handle, dword_t flags, lpvoid_t buffer,
   } else if (overlapped) {
     assert_true(!items_returned);
     kernel_state()->CompleteOverlappedImmediateEx(
-        overlapped, result, extended_result,
+        overlapped,
+        result == X_ERROR_SUCCESS ? X_ERROR_SUCCESS : X_ERROR_FUNCTION_FAILED,
+        X_HRESULT_FROM_WIN32(result),
         result == X_ERROR_SUCCESS ? item_count : 0);
     return X_ERROR_IO_PENDING;
   } else {
@@ -264,6 +419,12 @@ dword_result_t XamGetPrivateEnumStructureFromHandle(unknown_t unk1,
   return X_ERROR_INVALID_PARAMETER;
 }
 DECLARE_XAM_EXPORT1(XamGetPrivateEnumStructureFromHandle, kNone, kStub);
+
+dword_result_t XamQueryLiveHiveW(lpwstring_t name, lpvoid_t out_buf,
+                                 dword_t out_size, dword_t type /* guess */) {
+  return X_STATUS_INVALID_PARAMETER_1;
+}
+DECLARE_XAM_EXPORT1(XamQueryLiveHiveW, kNone, kStub);
 
 void RegisterInfoExports(xe::cpu::ExportResolver* export_resolver,
                          KernelState* kernel_state) {}
