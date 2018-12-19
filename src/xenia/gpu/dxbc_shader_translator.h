@@ -10,6 +10,8 @@
 #ifndef XENIA_GPU_DXBC_SHADER_TRANSLATOR_H_
 #define XENIA_GPU_DXBC_SHADER_TRANSLATOR_H_
 
+#include <gflags/gflags.h>
+
 #include <cstring>
 #include <string>
 #include <vector>
@@ -17,6 +19,8 @@
 #include "xenia/base/math.h"
 #include "xenia/base/string_buffer.h"
 #include "xenia/gpu/shader_translator.h"
+
+DECLARE_bool(dxbc_source_map);
 
 namespace xe {
 namespace gpu {
@@ -776,19 +780,19 @@ class DxbcShaderTranslator : public ShaderTranslator {
 
   // Use these instead of is_vertex_shader/is_pixel_shader because they don't
   // take is_depth_only_pixel_shader_ into account.
-  inline bool IsDXBCVertexOrDomainShader() const {
+  inline bool IsDxbcVertexOrDomainShader() const {
     return !is_depth_only_pixel_shader_ && is_vertex_shader();
   }
-  inline bool IsDXBCVertexShader() const {
-    return IsDXBCVertexOrDomainShader() &&
+  inline bool IsDxbcVertexShader() const {
+    return IsDxbcVertexOrDomainShader() &&
            vertex_shader_type_ == VertexShaderType::kVertex;
   }
-  inline bool IsDXBCDomainShader() const {
-    return IsDXBCVertexOrDomainShader() &&
+  inline bool IsDxbcDomainShader() const {
+    return IsDxbcVertexOrDomainShader() &&
            (vertex_shader_type_ == VertexShaderType::kTriangleDomain ||
             vertex_shader_type_ == VertexShaderType::kQuadDomain);
   }
-  inline bool IsDXBCPixelShader() const {
+  inline bool IsDxbcPixelShader() const {
     return is_depth_only_pixel_shader_ || is_pixel_shader();
   }
 
@@ -799,10 +803,6 @@ class DxbcShaderTranslator : public ShaderTranslator {
   uint32_t PushSystemTemp(bool zero = false);
   // Frees the last allocated internal r# registers for later reuse.
   void PopSystemTemp(uint32_t count = 1);
-
-  // Whether general-purpose register values should be stored in x0 rather than
-  // r# in this shader.
-  bool IndexableGPRsUsed() const;
 
   // Writing the prologue.
   void StartVertexShader_LoadVertexIndex();
