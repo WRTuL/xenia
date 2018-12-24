@@ -42,6 +42,8 @@ using namespace ucode;
 // Lots of naming comes from the disassembly spit out by the XNA GS compiler
 // and dumps of d3dcompiler and games: https://pastebin.com/i4kAv7bB
 
+constexpr uint32_t ShaderTranslator::kMaxMemExports;
+
 ShaderTranslator::ShaderTranslator() = default;
 
 ShaderTranslator::~ShaderTranslator() = default;
@@ -63,6 +65,10 @@ void ShaderTranslator::Reset() {
     writes_color_targets_[i] = false;
   }
   writes_depth_ = false;
+  memexport_alloc_count_ = 0;
+  memexport_eA_written_ = 0;
+  std::memset(&memexport_eM_written_, 0, sizeof(memexport_eM_written_));
+  memexport_stream_constants_.clear();
 }
 
 bool ShaderTranslator::GatherAllBindingInformation(Shader* shader) {
@@ -139,6 +145,15 @@ bool ShaderTranslator::TranslateInternal(Shader* shader) {
     GatherInstructionInformation(cf_a);
     GatherInstructionInformation(cf_b);
   }
+  // Cleanup invalid/unneeded memexport allocs.
+  for (uint32_t i = 0; i < kMaxMemExports; ++i) {
+    if (!memexport_eM_written_[i]) {
+      memexport_eA_written_ &= ~(1u << i);
+    }
+  }
+  if (memexport_eA_written_ == 0) {
+    memexport_stream_constants_.clear();
+  }
 
   StartTranslation();
 
@@ -173,6 +188,10 @@ bool ShaderTranslator::TranslateInternal(Shader* shader) {
   shader->constant_register_map_ = std::move(constant_register_map_);
   for (size_t i = 0; i < xe::countof(writes_color_targets_); ++i) {
     shader->writes_color_targets_[i] = writes_color_targets_[i];
+  }
+  shader->memexport_stream_constants_.clear();
+  for (uint32_t memexport_stream_constant : memexport_stream_constants_) {
+    shader->memexport_stream_constants_.push_back(memexport_stream_constant);
   }
 
   shader->is_valid_ = true;
@@ -282,6 +301,31 @@ void ShaderTranslator::GatherInstructionInformation(
                   writes_depth_ = true;
                 }
               }
+              if (memexport_alloc_count_ > 0 &&
+                  memexport_alloc_count_ <= kMaxMemExports) {
+                // Store used memexport constants because CPU code needs
+                // addresses and sizes, and also whether there have been writes
+                // to eA and eM# for register allocation in shader translator
+                // implementations.
+                // eA is (hopefully) always written to using:
+                // mad eA, r#, const0100, c#
+                // (though there are some exceptions, shaders in Halo 3 for some
+                // reason set eA to zeros, but the swizzle of the constant is
+                // not .xyzw in this case, and they don't write to eM#).
+                uint32_t memexport_alloc_index = memexport_alloc_count_ - 1;
+                if (op.vector_dest() == 32 &&
+                    op.vector_opcode() == AluVectorOpcode::kMad &&
+                    op.vector_write_mask() == 0b1111 && !op.src_is_temp(3) &&
+                    op.src_swizzle(3) == 0) {
+                  memexport_eA_written_ |= 1u << memexport_alloc_index;
+                  memexport_stream_constants_.insert(op.src_reg(3));
+                } else if (op.vector_dest() >= 33 && op.vector_dest() <= 37) {
+                  if (memexport_eA_written_ & (1u << memexport_alloc_index)) {
+                    memexport_eM_written_[memexport_alloc_index] |=
+                        1 << (op.vector_dest() - 33);
+                  }
+                }
+              }
             } else {
               if (op.is_vector_dest_relative()) {
                 uses_register_dynamic_addressing_ = true;
@@ -303,6 +347,15 @@ void ShaderTranslator::GatherInstructionInformation(
                   writes_depth_ = true;
                 }
               }
+              if (memexport_alloc_count_ > 0 &&
+                  memexport_alloc_count_ <= kMaxMemExports &&
+                  op.scalar_dest() >= 33 && op.scalar_dest() <= 37) {
+                uint32_t memexport_alloc_index = memexport_alloc_count_ - 1;
+                if (memexport_eA_written_ & (1u << memexport_alloc_index)) {
+                  memexport_eM_written_[memexport_alloc_index] |=
+                      1 << (op.scalar_dest() - 33);
+                }
+              }
             } else {
               if (op.is_scalar_dest_relative()) {
                 uses_register_dynamic_addressing_ = true;
@@ -312,6 +365,11 @@ void ShaderTranslator::GatherInstructionInformation(
         }
       }
     } break;
+    case ControlFlowOpcode::kAlloc:
+      if (cf.alloc.alloc_type() == AllocType::kMemory) {
+        ++memexport_alloc_count_;
+      }
+      break;
     default:
       break;
   }
