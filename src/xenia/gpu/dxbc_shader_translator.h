@@ -276,7 +276,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // vec4 0
     uint32_t flags;
     uint32_t vertex_index_endian;
-    uint32_t vertex_base_index;
+    int32_t vertex_base_index;
     uint32_t pixel_pos_reg;
 
     // vec4 1
@@ -830,6 +830,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
   void StartPixelShader();
 
   // Writing the epilogue.
+  // ExportToMemory modifies the values of eA/eM# for simplicity, don't call
+  // multiple times.
+  void ExportToMemory();
   void CompleteVertexOrDomainShader();
   // Converts four depth values to 24-bit unorm or float, depending on the flag
   // value.
