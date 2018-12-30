@@ -353,6 +353,7 @@ void RenderTargetCache::ClearCache() {
     delete resolve_target;
   }
   resolve_targets_.clear();
+  COUNT_profile_set("gpu/render_target_cache/resolve_targets", 0);
 
   for (auto render_target_pair : render_targets_) {
     RenderTarget* render_target = render_target_pair.second;
@@ -360,6 +361,7 @@ void RenderTargetCache::ClearCache() {
     delete render_target;
   }
   render_targets_.clear();
+  COUNT_profile_set("gpu/render_target_cache/render_targets", 0);
 
   while (descriptor_heaps_depth_ != nullptr) {
     auto heap = descriptor_heaps_depth_;
@@ -1277,7 +1279,7 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
           break;
         case ColorRenderTargetFormat::k_2_10_10_10:
         case ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
-        case ColorRenderTargetFormat::k_2_10_10_10_AS_16_16_16_16:
+        case ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
         case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
           root_constants.tile_sample_dest_info |= (10 << 19) | (20 << 24);
           break;
@@ -1557,7 +1559,7 @@ bool RenderTargetCache::ResolveCopy(SharedMemory* shared_memory,
         case ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
         case ColorRenderTargetFormat::k_16_16_16_16:
         case ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
-        case ColorRenderTargetFormat::k_2_10_10_10_AS_16_16_16_16:
+        case ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
         case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
           swizzle = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(2, 1, 0, 3);
           break;
@@ -1938,6 +1940,8 @@ RenderTargetCache::ResolveTarget* RenderTargetCache::FindOrCreateResolveTarget(
       xe::align(copy_buffer_size, UINT64(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
   resolve_target->copy_buffer_size = uint32_t(copy_buffer_size);
   resolve_targets_.insert(std::make_pair(key.value, resolve_target));
+  COUNT_profile_set("gpu/render_target_cache/resolve_targets",
+                    resolve_targets_.size());
 
   return resolve_target;
 }
@@ -1973,7 +1977,7 @@ ColorRenderTargetFormat RenderTargetCache::GetBaseColorFormat(
   switch (format) {
     case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
       return ColorRenderTargetFormat::k_8_8_8_8;
-    case ColorRenderTargetFormat::k_2_10_10_10_AS_16_16_16_16:
+    case ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
       return ColorRenderTargetFormat::k_2_10_10_10;
     case ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16:
       return ColorRenderTargetFormat::k_2_10_10_10_FLOAT;
@@ -1989,7 +1993,7 @@ DXGI_FORMAT RenderTargetCache::GetColorDXGIFormat(
     case ColorRenderTargetFormat::k_8_8_8_8_GAMMA:
       return DXGI_FORMAT_R8G8B8A8_UNORM;
     case ColorRenderTargetFormat::k_2_10_10_10:
-    case ColorRenderTargetFormat::k_2_10_10_10_AS_16_16_16_16:
+    case ColorRenderTargetFormat::k_2_10_10_10_AS_10_10_10_10:
       return DXGI_FORMAT_R10G10B10A2_UNORM;
     case ColorRenderTargetFormat::k_2_10_10_10_FLOAT:
     case ColorRenderTargetFormat::k_16_16_16_16_FLOAT:
@@ -2254,6 +2258,8 @@ RenderTargetCache::RenderTarget* RenderTargetCache::FindOrCreateRenderTarget(
                                 &copy_buffer_size);
   render_target->copy_buffer_size = uint32_t(copy_buffer_size);
   render_targets_.insert(std::make_pair(key.value, render_target));
+  COUNT_profile_set("gpu/render_target_cache/render_targets",
+                    render_targets_.size());
 #if 0
   XELOGGPU(
       "Created %ux%u %s render target with format %u at heap 4 MB pages %u:%u",
