@@ -89,6 +89,55 @@ DxbcShaderTranslator::DxbcShaderTranslator(uint32_t vendor_id,
 }
 DxbcShaderTranslator::~DxbcShaderTranslator() = default;
 
+std::vector<uint8_t> DxbcShaderTranslator::ForceEarlyDepthStencil(
+    const uint8_t* shader) {
+  const uint32_t* old_shader = reinterpret_cast<const uint32_t*>(shader);
+
+  // To return something anyway even if patching fails.
+  std::vector<uint8_t> new_shader;
+  uint32_t shader_size_bytes = old_shader[6];
+  new_shader.resize(shader_size_bytes);
+  std::memcpy(new_shader.data(), shader, shader_size_bytes);
+
+  // Find the SHEX chunk.
+  uint32_t chunk_count = old_shader[7];
+  for (uint32_t i = 0; i < chunk_count; ++i) {
+    uint32_t chunk_offset_bytes = old_shader[8 + i];
+    const uint32_t* chunk = old_shader + chunk_offset_bytes / sizeof(uint32_t);
+    if (chunk[0] != 'XEHS') {
+      continue;
+    }
+    // Find dcl_globalFlags and patch it.
+    uint32_t code_size_dwords = chunk[3];
+    chunk += 4;
+    for (uint32_t j = 0; j < code_size_dwords;) {
+      uint32_t opcode_token = chunk[j];
+      uint32_t opcode = DECODE_D3D10_SB_OPCODE_TYPE(opcode_token);
+      if (opcode == D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS) {
+        opcode_token |= D3D11_SB_GLOBAL_FLAG_FORCE_EARLY_DEPTH_STENCIL;
+        std::memcpy(new_shader.data() +
+                        (chunk_offset_bytes + (4 + j) * sizeof(uint32_t)),
+                    &opcode_token, sizeof(uint32_t));
+        // Recalculate the checksum since the shader was modified.
+        CalculateDXBCChecksum(
+            reinterpret_cast<unsigned char*>(new_shader.data()),
+            shader_size_bytes,
+            reinterpret_cast<unsigned int*>(new_shader.data() +
+                                            sizeof(uint32_t)));
+        break;
+      }
+      if (opcode == D3D10_SB_OPCODE_CUSTOMDATA) {
+        j += chunk[j + 1];
+      } else {
+        j += DECODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(opcode_token);
+      }
+    }
+    break;
+  }
+
+  return std::move(new_shader);
+}
+
 std::vector<uint8_t> DxbcShaderTranslator::CreateDepthOnlyPixelShader() {
   Reset();
   is_depth_only_pixel_shader_ = true;
@@ -1893,12 +1942,15 @@ uint32_t DxbcShaderTranslator::DxbcSourceOperandLength(
       // totally invalid operand replaced by a literal.
       return 5;
   }
-  // Apply both the operand negation and the usage negation (for subtraction)
-  // and absolute from both sources.
-  if (operand.is_negated) {
-    negate = !negate;
+  // Apply overrides (for instance, for subtraction). Xenos operand modifiers
+  // are ignored when forcing absolute value (though negated absolute can still
+  // be forced in this case).
+  if (!absolute) {
+    if (operand.is_negated) {
+      negate = !negate;
+    }
+    absolute |= operand.is_absolute_value;
   }
-  absolute |= operand.is_absolute_value;
   // Modifier extension - neg/abs or non-uniform binding index.
   if (negate || absolute) {
     ++length;
@@ -1932,12 +1984,15 @@ void DxbcShaderTranslator::UseDxbcSourceOperand(
                       (swizzle << D3D10_SB_OPERAND_4_COMPONENT_SWIZZLE_SHIFT);
   }
 
-  // Apply both the operand negation and the usage negation (for subtraction)
-  // and absolute value from both sources.
-  if (operand.is_negated) {
-    negate = !negate;
+  // Apply overrides (for instance, for subtraction). Xenos operand modifiers
+  // are ignored when forcing absolute value (though negated absolute can still
+  // be forced in this case).
+  if (!absolute) {
+    if (operand.is_negated) {
+      negate = !negate;
+    }
+    absolute |= operand.is_absolute_value;
   }
-  absolute |= operand.is_absolute_value;
   // Build OperandToken1 for modifiers (negate, absolute, minimum precision,
   // non-uniform binding index) - if it has any, it will be non-zero.
   // NOTE: AMD GPUs or drivers do NOT support non-uniform constant buffer
@@ -4034,7 +4089,8 @@ void DxbcShaderTranslator::WriteShaderCode() {
   }
 
   // Don't allow refactoring when converting to native code to maintain position
-  // invariance (needed even in pixel shaders for oDepth invariance).
+  // invariance (needed even in pixel shaders for oDepth invariance). Also this
+  // dcl will be modified by ForceEarlyDepthStencil.
   shader_object_.push_back(
       ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_GLOBAL_FLAGS) |
       ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(1));
@@ -4107,63 +4163,65 @@ void DxbcShaderTranslator::WriteShaderCode() {
     shader_object_.push_back(0);
   }
 
-  // Samplers.
-  for (uint32_t i = 0; i < uint32_t(sampler_bindings_.size()); ++i) {
-    const SamplerBinding& sampler_binding = sampler_bindings_[i];
+  if (!is_depth_only_pixel_shader_) {
+    // Samplers.
+    for (uint32_t i = 0; i < uint32_t(sampler_bindings_.size()); ++i) {
+      const SamplerBinding& sampler_binding = sampler_bindings_[i];
+      shader_object_.push_back(
+          ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_SAMPLER) |
+          ENCODE_D3D10_SB_SAMPLER_MODE(D3D10_SB_SAMPLER_MODE_DEFAULT) |
+          ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(6));
+      shader_object_.push_back(EncodeVectorSwizzledOperand(
+          D3D10_SB_OPERAND_TYPE_SAMPLER, kSwizzleXYZW, 3));
+      shader_object_.push_back(i);
+      shader_object_.push_back(i);
+      shader_object_.push_back(i);
+      shader_object_.push_back(0);
+    }
+
+    // Shader resources.
+    // Shared memory ByteAddressBuffer (T0, at t0, space0).
     shader_object_.push_back(
-        ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_SAMPLER) |
-        ENCODE_D3D10_SB_SAMPLER_MODE(D3D10_SB_SAMPLER_MODE_DEFAULT) |
+        ENCODE_D3D10_SB_OPCODE_TYPE(D3D11_SB_OPCODE_DCL_RESOURCE_RAW) |
         ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(6));
     shader_object_.push_back(EncodeVectorSwizzledOperand(
-        D3D10_SB_OPERAND_TYPE_SAMPLER, kSwizzleXYZW, 3));
-    shader_object_.push_back(i);
-    shader_object_.push_back(i);
-    shader_object_.push_back(i);
-    shader_object_.push_back(0);
-  }
-
-  // Shader resources.
-  // Shared memory ByteAddressBuffer (T0, at t0, space0).
-  shader_object_.push_back(
-      ENCODE_D3D10_SB_OPCODE_TYPE(D3D11_SB_OPCODE_DCL_RESOURCE_RAW) |
-      ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(6));
-  shader_object_.push_back(EncodeVectorSwizzledOperand(
-      D3D10_SB_OPERAND_TYPE_RESOURCE, kSwizzleXYZW, 3));
-  shader_object_.push_back(0);
-  shader_object_.push_back(0);
-  shader_object_.push_back(0);
-  shader_object_.push_back(0);
-  // Textures.
-  for (uint32_t i = 0; i < uint32_t(texture_srvs_.size()); ++i) {
-    const TextureSRV& texture_srv = texture_srvs_[i];
-    D3D10_SB_RESOURCE_DIMENSION texture_srv_dimension;
-    switch (texture_srv.dimension) {
-      case TextureDimension::k3D:
-        texture_srv_dimension = D3D10_SB_RESOURCE_DIMENSION_TEXTURE3D;
-        break;
-      case TextureDimension::kCube:
-        texture_srv_dimension = D3D10_SB_RESOURCE_DIMENSION_TEXTURECUBE;
-        break;
-      default:
-        texture_srv_dimension = D3D10_SB_RESOURCE_DIMENSION_TEXTURE2DARRAY;
-    }
-    shader_object_.push_back(
-        ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_RESOURCE) |
-        ENCODE_D3D10_SB_RESOURCE_DIMENSION(texture_srv_dimension) |
-        ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(7));
-    shader_object_.push_back(EncodeVectorSwizzledOperand(
         D3D10_SB_OPERAND_TYPE_RESOURCE, kSwizzleXYZW, 3));
-    // T0 is shared memory.
-    shader_object_.push_back(1 + i);
-    // t0 is shared memory.
-    shader_object_.push_back(1 + i);
-    shader_object_.push_back(1 + i);
-    shader_object_.push_back(
-        ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_FLOAT, 0) |
-        ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_FLOAT, 1) |
-        ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_FLOAT, 2) |
-        ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_FLOAT, 3));
     shader_object_.push_back(0);
+    shader_object_.push_back(0);
+    shader_object_.push_back(0);
+    shader_object_.push_back(0);
+    // Textures.
+    for (uint32_t i = 0; i < uint32_t(texture_srvs_.size()); ++i) {
+      const TextureSRV& texture_srv = texture_srvs_[i];
+      D3D10_SB_RESOURCE_DIMENSION texture_srv_dimension;
+      switch (texture_srv.dimension) {
+        case TextureDimension::k3D:
+          texture_srv_dimension = D3D10_SB_RESOURCE_DIMENSION_TEXTURE3D;
+          break;
+        case TextureDimension::kCube:
+          texture_srv_dimension = D3D10_SB_RESOURCE_DIMENSION_TEXTURECUBE;
+          break;
+        default:
+          texture_srv_dimension = D3D10_SB_RESOURCE_DIMENSION_TEXTURE2DARRAY;
+      }
+      shader_object_.push_back(
+          ENCODE_D3D10_SB_OPCODE_TYPE(D3D10_SB_OPCODE_DCL_RESOURCE) |
+          ENCODE_D3D10_SB_RESOURCE_DIMENSION(texture_srv_dimension) |
+          ENCODE_D3D10_SB_TOKENIZED_INSTRUCTION_LENGTH(7));
+      shader_object_.push_back(EncodeVectorSwizzledOperand(
+          D3D10_SB_OPERAND_TYPE_RESOURCE, kSwizzleXYZW, 3));
+      // T0 is shared memory.
+      shader_object_.push_back(1 + i);
+      // t0 is shared memory.
+      shader_object_.push_back(1 + i);
+      shader_object_.push_back(1 + i);
+      shader_object_.push_back(
+          ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_FLOAT, 0) |
+          ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_FLOAT, 1) |
+          ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_FLOAT, 2) |
+          ENCODE_D3D10_SB_RESOURCE_RETURN_TYPE(D3D10_SB_RETURN_TYPE_FLOAT, 3));
+      shader_object_.push_back(0);
+    }
   }
 
   // Unordered access views.
