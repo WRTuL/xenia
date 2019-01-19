@@ -1237,11 +1237,6 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
   } else {
     adaptive_tessellation = false;
   }
-  // TODO(Triang3l): Non-indexed line loops (by movc'ing zero to the vertex
-  // index if it's one beyond the end).
-  if (primitive_type == PrimitiveType::kLineLoop && !indexed) {
-    return false;
-  }
   PrimitiveType primitive_type_converted =
       PrimitiveConverter::GetReplacementPrimitiveType(primitive_type);
   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
@@ -1278,6 +1273,18 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
     primitive_topology_ = primitive_topology;
     deferred_command_list_->D3DIASetPrimitiveTopology(primitive_topology);
   }
+  uint32_t line_loop_closing_index;
+  if (primitive_type == PrimitiveType::kLineLoop && !indexed &&
+      index_count >= 3) {
+    // Add a vertex to close the loop, and make the vertex shader replace its
+    // index (before adding the offset) with 0 to fetch the first vertex again.
+    // For indexed line loops, the primitive converter will add the vertex.
+    line_loop_closing_index = index_count;
+    ++index_count;
+  } else {
+    // Replace index 0 with 0 (do nothing) otherwise.
+    line_loop_closing_index = 0;
+  }
 
   // Update the textures - this may bind pipelines.
   texture_cache_->RequestTextures(
@@ -1305,7 +1312,7 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
 
   // Update system constants before uploading them.
   UpdateSystemConstantValues(
-      memexport_used, primitive_type,
+      memexport_used, primitive_type, line_loop_closing_index,
       indexed ? index_buffer_info->endianness : Endian::kUnspecified,
       adaptive_tessellation ? (index_buffer_info->guest_base & 0x1FFFFFFC) : 0,
       color_mask, pipeline_render_targets);
@@ -1886,7 +1893,8 @@ void D3D12CommandProcessor::UpdateFixedFunctionState() {
 
 void D3D12CommandProcessor::UpdateSystemConstantValues(
     bool shared_memory_is_uav, PrimitiveType primitive_type,
-    Endian index_endian, uint32_t edge_factor_base, uint32_t color_mask,
+    uint32_t line_loop_closing_index, Endian index_endian,
+    uint32_t edge_factor_base, uint32_t color_mask,
     const RenderTargetCache::PipelineRenderTarget render_targets[4]) {
   auto& regs = *register_file_;
 
@@ -1907,7 +1915,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   uint32_t sq_context_misc = regs[XE_GPU_REG_SQ_CONTEXT_MISC].u32;
   uint32_t rb_surface_info = regs[XE_GPU_REG_RB_SURFACE_INFO].u32;
   uint32_t rb_colorcontrol = regs[XE_GPU_REG_RB_COLORCONTROL].u32;
-  uint32_t rb_alpha_ref = regs[XE_GPU_REG_RB_ALPHA_REF].u32;
+  float rb_alpha_ref = regs[XE_GPU_REG_RB_ALPHA_REF].f32;
   uint32_t pa_su_sc_mode_cntl = regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL].u32;
 
   // Get the color info register values for each render target, and also put
@@ -2011,6 +2019,15 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   if (viewport_scale_z < 0.0f) {
     flags |= DxbcShaderTranslator::kSysFlag_ReverseZ;
   }
+  // Alpha test.
+  if (rb_colorcontrol & 0x8) {
+    flags |= (rb_colorcontrol & 0x7)
+             << DxbcShaderTranslator::kSysFlag_AlphaPassIfLess_Shift;
+  } else {
+    flags |= DxbcShaderTranslator::kSysFlag_AlphaPassIfLess |
+             DxbcShaderTranslator::kSysFlag_AlphaPassIfEqual |
+             DxbcShaderTranslator::kSysFlag_AlphaPassIfGreater;
+  }
   // Gamma writing.
   if (((regs[XE_GPU_REG_RB_COLOR_INFO].u32 >> 16) & 0xF) ==
       uint32_t(ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
@@ -2070,6 +2087,11 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   dirty |= system_constants_.tessellation_factor_range_max !=
            tessellation_factor_max;
   system_constants_.tessellation_factor_range_max = tessellation_factor_max;
+
+  // Line loop closing index (or 0 when drawing other primitives or using an
+  // index buffer).
+  dirty |= system_constants_.line_loop_closing_index != line_loop_closing_index;
+  system_constants_.line_loop_closing_index = line_loop_closing_index;
 
   // Vertex index offset.
   dirty |= system_constants_.vertex_base_index != vgt_indx_offset;
@@ -2198,37 +2220,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   system_constants_.sample_count_log2[1] = sample_count_log2_y;
 
   // Alpha test.
-  int32_t alpha_test;
-  uint32_t alpha_test_function = rb_colorcontrol & 0x7;
-  if ((rb_colorcontrol & 0x8) && alpha_test_function != 0x7) {
-    // 0: Never - fail in [-inf, +inf].
-    // 1: Less - fail in [ref, +inf].
-    // 2: Equal - pass in [ref, ref].
-    // 3: Less or equal - pass in [-inf, ref].
-    // 4: Greater - fail in [-inf, ref].
-    // 5: Not equal - fail in [ref, ref].
-    // 6: Greater or equal - pass in [ref, +inf].
-    // 7: Always - pass in [-inf, +inf].
-    alpha_test = (alpha_test_function & 0x2) ? 1 : -1;
-    uint32_t alpha_test_range_start =
-        (alpha_test_function == 1 || alpha_test_function == 2 ||
-         alpha_test_function == 5 || alpha_test_function == 6)
-            ? rb_alpha_ref
-            : 0xFF800000u;
-    uint32_t alpha_test_range_end =
-        (alpha_test_function == 2 || alpha_test_function == 3 ||
-         alpha_test_function == 4 || alpha_test_function == 5)
-            ? rb_alpha_ref
-            : 0x7F800000u;
-    dirty |= system_constants_.alpha_test_range[0] != alpha_test_range_start;
-    dirty |= system_constants_.alpha_test_range[1] != alpha_test_range_end;
-    system_constants_.alpha_test_range[0] = alpha_test_range_start;
-    system_constants_.alpha_test_range[1] = alpha_test_range_end;
-  } else {
-    alpha_test = 0;
-  }
-  dirty |= system_constants_.alpha_test != alpha_test;
-  system_constants_.alpha_test = alpha_test;
+  dirty |= system_constants_.alpha_test_reference != rb_alpha_ref;
+  system_constants_.alpha_test_reference = rb_alpha_ref;
 
   // EDRAM pitch for ROV writing.
   if (IsROVUsedForEDRAM()) {
@@ -2810,14 +2803,14 @@ bool D3D12CommandProcessor::UpdateBindings(
     // If updating fully, write the shared memory SRV and UAV descriptors and,
     // if needed, the EDRAM descriptor.
     gpu_handle_shared_memory_and_edram_ = view_gpu_handle;
-    shared_memory_->CreateSRV(view_cpu_handle);
+    shared_memory_->WriteRawSRVDescriptor(view_cpu_handle);
     view_cpu_handle.ptr += descriptor_size_view;
     view_gpu_handle.ptr += descriptor_size_view;
-    shared_memory_->CreateRawUAV(view_cpu_handle);
+    shared_memory_->WriteRawUAVDescriptor(view_cpu_handle);
     view_cpu_handle.ptr += descriptor_size_view;
     view_gpu_handle.ptr += descriptor_size_view;
     if (IsROVUsedForEDRAM()) {
-      render_target_cache_->CreateEDRAMUint32UAV(view_cpu_handle);
+      render_target_cache_->WriteEDRAMUint32UAVDescriptor(view_cpu_handle);
       view_cpu_handle.ptr += descriptor_size_view;
       view_gpu_handle.ptr += descriptor_size_view;
     }
