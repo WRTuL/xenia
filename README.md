@@ -1,6 +1,6 @@
 <p align="center">
     <a href="https://github.com/xenia-project/xenia/tree/master/assets/icon">
-        <img height="370px" src="https://raw.githubusercontent.com/xenia-project/xenia/master/assets/icon/1024.png" />
+        <img height="120px" src="https://raw.githubusercontent.com/xenia-project/xenia/master/assets/icon/128.png" />
     </a>
 </p>
 
@@ -17,7 +17,7 @@ For developer chat join `#dev` but stay on topic. Lurking is not only fine, but 
 Please check the [frequently asked questions](https://xenia.jp/faq/) page before
 asking questions. We've got jobs/lives/etc, so don't expect instant answers.
 
-Discussing illegal activities will get you banned. No warnings.
+Discussing illegal activities will get you banned.
 
 ## Status
 
@@ -41,7 +41,7 @@ legally purchased devices and games and information made public on the internet
 
 ## Quickstart
 
-Windows 8.1+ with Python 3.4 and [Visual Studio 2017](https://www.visualstudio.com/downloads/) and the Windows SDKs installed:
+With Windows 8+, Python 3.4+, and [Visual Studio 2017 or 2019](https://www.visualstudio.com/downloads/) and the Windows SDKs installed:
 
     > git clone https://github.com/xenia-project/xenia.git
     > cd xenia
@@ -82,11 +82,12 @@ is wide open greenfield fun.
 Fixes and optimizations are always welcome (please!), but in addition to
 that there are some major work areas still untouched:
 
-* Help work through missing functionality/bugs in game [compat](https://github.com/xenia-project/xenia/issues?labels=compat)
-* Add input drivers for [PS4 controllers](https://github.com/xenia-project/xenia/issues/60) (or anything else)
+* Help work through [missing functionality/bugs in games](https://github.com/xenia-project/xenia/labels/compat)
+* Add input drivers for [DualShock4 (PS4) controllers](https://github.com/xenia-project/xenia/issues/60) (or anything else)
 * Skilled with Linux? A strong contributor is needed to [help with porting](https://github.com/xenia-project/xenia/labels/cross%20platform)
 
-See more projects [good for contributors](https://github.com/xenia-project/xenia/labels/good%20first%20issue). It's a good idea to ask on Discord/check the issues before beginning work on something.
+See more projects [good for contributors](https://github.com/xenia-project/xenia/labels/good%20first%20issue). It's a good idea to ask on Discord and check the issues page before beginning work on
+something.
 
 ## FAQ
 
@@ -94,5 +95,6 @@ For more see the main [frequently asked questions](https://xenia.jp/faq/) page.
 
 ### Can I get an exe?
 
-Check [Appveyor's artifacts](https://ci.appveyor.com/project/benvanik/xenia/build/artifacts) to see
-what's there.
+[d3d12 (D3D12)](https://ci.appveyor.com/api/projects/benvanik/xenia/artifacts/xenia-d3d12.zip?branch=d3d12&job=Configuration%3A%20Release&pr=false)
+
+[Master (Vulkan)](https://ci.appveyor.com/api/projects/benvanik/xenia/artifacts/xenia-master.zip?branch=master&job=Configuration%3A%20Release&pr=false)

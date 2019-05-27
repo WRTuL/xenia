@@ -7,7 +7,7 @@ objdir(build_obj)
 
 -- Define an ARCH variable
 -- Only use this to enable architecture-specific functionality.
-if os.is("linux") then
+if os.istarget("linux") then
   ARCH = os.outputof("uname -p")
 else
   ARCH = "unknown"
@@ -79,7 +79,9 @@ filter("configurations:Release")
     "NDEBUG",
     "_NO_DEBUG_HEAP=1",
   })
-  optimize("On")
+  optimize("speed")
+  inlining("Auto")
+  floatingpoint("Fast")
   flags({
     "LinkTimeOptimization",
   })
@@ -88,6 +90,9 @@ filter({"configurations:Release", "platforms:Windows"})
   linkoptions({
     "/NODEFAULTLIB:MSVCRTD",
   })
+  buildoptions({
+    "/GT", -- enable fiber-safe optimizations
+   })
 
 filter("platforms:Linux")
   system("linux")
@@ -207,9 +212,6 @@ if not os.isdir("scratch") then
   flags_file:write("#--flush_stdout=false\n")
   flags_file:write("\n")
   flags_file:write("#--vsync=false\n")
-  flags_file:write("#--gl_debug\n")
-  flags_file:write("#--gl_debug_output\n")
-  flags_file:write("#--gl_debug_output_synchronous\n")
   flags_file:write("#--trace_gpu_prefix=scratch/gpu/gpu_trace_\n")
   flags_file:write("#--trace_gpu_stream\n")
   flags_file:write("#--disable_framebuffer_readback\n")
@@ -221,13 +223,17 @@ solution("xenia")
   uuid("931ef4b0-6170-4f7a-aaf2-0fece7632747")
   startproject("xenia-app")
   architecture("x86_64")
-  if os.is("linux") then
+  if os.istarget("linux") then
     platforms({"Linux"})
-  elseif os.is("windows") then
+  elseif os.istarget("windows") then
     platforms({"Windows"})
     -- Minimum version to support ID3D12GraphicsCommandList1 (for
     -- SetSamplePositions).
-    systemversion("10.0.15063.0")
+    filter("action:vs2017")
+      systemversion("10.0.15063.0")
+    filter("action:vs2019")
+      systemversion("10.0")
+    filter({})
   end
   configurations({"Checked", "Debug", "Release"})
 
@@ -266,7 +272,7 @@ solution("xenia")
   include("src/xenia/ui/vulkan")
   include("src/xenia/vfs")
 
-  if os.is("windows") then
+  if os.istarget("windows") then
     include("src/xenia/apu/xaudio2")
     include("src/xenia/gpu/d3d12")
     include("src/xenia/hid/winkey")
