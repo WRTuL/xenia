@@ -139,17 +139,13 @@ void D3D12CommandProcessor::SubmitBarriers() {
 
 ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(
     const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
-    PrimitiveType primitive_type) {
+    bool tessellated) {
   assert_true(vertex_shader->is_translated());
   assert_true(pixel_shader == nullptr || pixel_shader->is_translated());
 
-  D3D12_SHADER_VISIBILITY vertex_visibility;
-  if (primitive_type == PrimitiveType::kTrianglePatch ||
-      primitive_type == PrimitiveType::kQuadPatch) {
-    vertex_visibility = D3D12_SHADER_VISIBILITY_DOMAIN;
-  } else {
-    vertex_visibility = D3D12_SHADER_VISIBILITY_VERTEX;
-  }
+  D3D12_SHADER_VISIBILITY vertex_visibility =
+      tessellated ? D3D12_SHADER_VISIBILITY_DOMAIN
+                  : D3D12_SHADER_VISIBILITY_VERTEX;
 
   uint32_t texture_count_vertex, sampler_count_vertex;
   vertex_shader->GetTextureSRVs(texture_count_vertex);
@@ -172,8 +168,7 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(
   index_offset += D3D12Shader::kMaxTextureSRVIndexBits;
   index |= sampler_count_vertex << index_offset;
   index_offset += D3D12Shader::kMaxSamplerBindingIndexBits;
-  index |= uint32_t(vertex_visibility == D3D12_SHADER_VISIBILITY_DOMAIN)
-           << index_offset;
+  index |= (tessellated ? 1 : 0) << index_offset;
   ++index_offset;
   assert_true(index_offset <= 32);
 
@@ -1157,6 +1152,15 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
     return true;
   }
 
+  // Check if using tessellation to get the correct primitive type.
+  bool tessellated;
+  if (uint32_t(primitive_type) >=
+      uint32_t(PrimitiveType::kExplicitMajorModeForceStart)) {
+    tessellated = (regs[XE_GPU_REG_VGT_OUTPUT_PATH_CNTL].u32 & 0x3) == 0x1;
+  } else {
+    tessellated = false;
+  }
+
   // Shaders will have already been defined by previous loads.
   // We need them to do just about anything so validate here.
   auto vertex_shader = static_cast<D3D12Shader*>(active_vertex_shader());
@@ -1176,7 +1180,7 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
   // which is needed by the render target cache, to check the possibility of
   // doing early depth/stencil, and also to get used textures and samplers.
   if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader, pixel_shader,
-                                                primitive_type)) {
+                                                tessellated, primitive_type)) {
     return false;
   }
 
@@ -1189,21 +1193,10 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
       !pixel_shader->memexport_stream_constants().empty();
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
-  if (!memexport_used_vertex &&
-      (regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL].u32 & 0x3) == 0x3 &&
-      primitive_type != PrimitiveType::kPointList &&
-      primitive_type != PrimitiveType::kRectangleList) {
-    // Both sides are culled - can't reproduce this with rasterizer state.
-    return true;
-  }
-
-  uint32_t color_mask = GetCurrentColorMask(pixel_shader);
-  uint32_t rb_depthcontrol = regs[XE_GPU_REG_RB_DEPTHCONTROL].u32;
-  uint32_t rb_stencilrefmask = regs[XE_GPU_REG_RB_STENCILREFMASK].u32;
-  if (!memexport_used && !color_mask &&
-      ((rb_depthcontrol & (0x2 | 0x4)) != (0x2 | 0x4)) &&
-      (!(rb_depthcontrol & 0x1) || !(rb_stencilrefmask & (0xFF << 16)))) {
-    // Not writing to color, depth or stencil, so doesn't draw.
+  bool primitive_two_faced = IsPrimitiveTwoFaced(tessellated, primitive_type);
+  if (!memexport_used_vertex && primitive_two_faced &&
+      (regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL].u32 & 0x3) == 0x3) {
+    // Both sides are culled - can't be expressed in the pipeline state.
     return true;
   }
 
@@ -1221,8 +1214,7 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
   // Adaptive tessellation requires an index buffer, but it contains per-edge
   // tessellation factors (as floats) instead of control point indices.
   bool adaptive_tessellation;
-  if (primitive_type == PrimitiveType::kTrianglePatch ||
-      primitive_type == PrimitiveType::kQuadPatch) {
+  if (tessellated) {
     TessellationMode tessellation_mode =
         TessellationMode(regs[XE_GPU_REG_VGT_HOS_CNTL].u32 & 0x3);
     adaptive_tessellation = tessellation_mode == TessellationMode::kAdaptive;
@@ -1245,44 +1237,54 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
   } else {
     adaptive_tessellation = false;
   }
-  PrimitiveType primitive_type_converted =
-      PrimitiveConverter::GetReplacementPrimitiveType(primitive_type);
+  PrimitiveType primitive_type_converted;
   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
-  switch (primitive_type_converted) {
-    case PrimitiveType::kPointList:
-      primitive_topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
-      break;
-    case PrimitiveType::kLineList:
-      primitive_topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
-      break;
-    case PrimitiveType::kLineStrip:
-      primitive_topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
-      break;
-    case PrimitiveType::kTriangleList:
-    case PrimitiveType::kRectangleList:
-      primitive_topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-      break;
-    case PrimitiveType::kTriangleStrip:
-      primitive_topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
-      break;
-    case PrimitiveType::kQuadList:
-      primitive_topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
-      break;
-    case PrimitiveType::kTrianglePatch:
-      primitive_topology = D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST;
-      break;
-    case PrimitiveType::kQuadPatch:
-      primitive_topology = D3D_PRIMITIVE_TOPOLOGY_4_CONTROL_POINT_PATCHLIST;
-      break;
-    default:
-      return false;
+  if (tessellated) {
+    primitive_type_converted = primitive_type;
+    switch (primitive_type_converted) {
+      // TODO(Triang3l): Support line patches.
+      case PrimitiveType::kTrianglePatch:
+        primitive_topology = D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST;
+        break;
+      case PrimitiveType::kQuadPatch:
+        primitive_topology = D3D_PRIMITIVE_TOPOLOGY_4_CONTROL_POINT_PATCHLIST;
+        break;
+      default:
+        return false;
+    }
+  } else {
+    primitive_type_converted =
+        PrimitiveConverter::GetReplacementPrimitiveType(primitive_type);
+    switch (primitive_type_converted) {
+      case PrimitiveType::kPointList:
+        primitive_topology = D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+        break;
+      case PrimitiveType::kLineList:
+        primitive_topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
+        break;
+      case PrimitiveType::kLineStrip:
+        primitive_topology = D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
+        break;
+      case PrimitiveType::kTriangleList:
+      case PrimitiveType::kRectangleList:
+        primitive_topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        break;
+      case PrimitiveType::kTriangleStrip:
+        primitive_topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+        break;
+      case PrimitiveType::kQuadList:
+        primitive_topology = D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ;
+        break;
+      default:
+        return false;
+    }
   }
   if (primitive_topology_ != primitive_topology) {
     primitive_topology_ = primitive_topology;
     deferred_command_list_->D3DIASetPrimitiveTopology(primitive_topology);
   }
   uint32_t line_loop_closing_index;
-  if (primitive_type == PrimitiveType::kLineLoop && !indexed &&
+  if (!tessellated && primitive_type == PrimitiveType::kLineLoop && !indexed &&
       index_count >= 3) {
     // Add a vertex to close the loop, and make the vertex shader replace its
     // index (before adding the offset) with 0 to fetch the first vertex again.
@@ -1301,6 +1303,7 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
 
   // Check if early depth/stencil can be enabled explicitly by RB_DEPTHCONTROL
   // or implicitly when alpha test and alpha to coverage are disabled.
+  uint32_t rb_depthcontrol = regs[XE_GPU_REG_RB_DEPTHCONTROL].u32;
   uint32_t rb_colorcontrol = regs[XE_GPU_REG_RB_COLORCONTROL].u32;
   bool early_z = false;
   if (pixel_shader == nullptr) {
@@ -1318,7 +1321,7 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
   void* pipeline_handle;
   ID3D12RootSignature* root_signature;
   if (!pipeline_cache_->ConfigurePipeline(
-          vertex_shader, pixel_shader, primitive_type_converted,
+          vertex_shader, pixel_shader, tessellated, primitive_type_converted,
           indexed ? index_buffer_info->format : IndexFormat::kInt16, early_z,
           pipeline_render_targets, &pipeline_handle, &root_signature)) {
     return false;
@@ -1331,14 +1334,14 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
   }
 
   // Update viewport, scissor, blend factor and stencil reference.
-  UpdateFixedFunctionState();
+  UpdateFixedFunctionState(primitive_two_faced);
 
   // Update system constants before uploading them.
   UpdateSystemConstantValues(
-      memexport_used, primitive_type, line_loop_closing_index,
+      memexport_used, primitive_two_faced, line_loop_closing_index,
       indexed ? index_buffer_info->endianness : Endian::kUnspecified,
       adaptive_tessellation ? (index_buffer_info->guest_base & 0x1FFFFFFC) : 0,
-      early_z, color_mask, pipeline_render_targets);
+      early_z, GetCurrentColorMask(pixel_shader), pipeline_render_targets);
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature)) {
@@ -1494,18 +1497,23 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
     index_buffer_view.Format = index_buffer_info->format == IndexFormat::kInt32
                                    ? DXGI_FORMAT_R32_UINT
                                    : DXGI_FORMAT_R16_UINT;
+    PrimitiveConverter::ConversionResult conversion_result;
     uint32_t converted_index_count;
-    PrimitiveConverter::ConversionResult conversion_result =
-        primitive_converter_->ConvertPrimitives(
-            primitive_type, index_buffer_info->guest_base, index_count,
-            index_buffer_info->format, index_buffer_info->endianness,
-            index_buffer_view.BufferLocation, converted_index_count);
-    if (conversion_result == PrimitiveConverter::ConversionResult::kFailed) {
-      return false;
-    }
-    if (conversion_result ==
-        PrimitiveConverter::ConversionResult::kPrimitiveEmpty) {
-      return true;
+    if (tessellated) {
+      conversion_result =
+          PrimitiveConverter::ConversionResult::kConversionNotNeeded;
+    } else {
+      conversion_result = primitive_converter_->ConvertPrimitives(
+          primitive_type, index_buffer_info->guest_base, index_count,
+          index_buffer_info->format, index_buffer_info->endianness,
+          index_buffer_view.BufferLocation, converted_index_count);
+      if (conversion_result == PrimitiveConverter::ConversionResult::kFailed) {
+        return false;
+      }
+      if (conversion_result ==
+          PrimitiveConverter::ConversionResult::kPrimitiveEmpty) {
+        return true;
+      }
     }
     ID3D12Resource* scratch_index_buffer = nullptr;
     if (conversion_result == PrimitiveConverter::ConversionResult::kConverted) {
@@ -1564,10 +1572,11 @@ bool D3D12CommandProcessor::IssueDraw(PrimitiveType primitive_type,
     }
   } else {
     // Check if need to draw using a conversion index buffer.
-    uint32_t converted_index_count;
+    uint32_t converted_index_count = 0;
     D3D12_GPU_VIRTUAL_ADDRESS conversion_gpu_address =
-        primitive_converter_->GetStaticIndexBuffer(primitive_type, index_count,
-                                                   converted_index_count);
+        tessellated ? 0
+                    : primitive_converter_->GetStaticIndexBuffer(
+                          primitive_type, index_count, converted_index_count);
     if (memexport_used) {
       shared_memory_->UseForWriting();
     } else {
@@ -1791,7 +1800,7 @@ bool D3D12CommandProcessor::EndFrame() {
   return true;
 }
 
-void D3D12CommandProcessor::UpdateFixedFunctionState() {
+void D3D12CommandProcessor::UpdateFixedFunctionState(bool primitive_two_faced) {
   auto& regs = *register_file_;
 
 #if FINE_GRAINED_DRAW_SCOPES
@@ -1942,8 +1951,15 @@ void D3D12CommandProcessor::UpdateFixedFunctionState() {
       ff_blend_factor_update_needed_ = false;
     }
 
-    // Stencil reference value.
-    uint32_t stencil_ref = regs[XE_GPU_REG_RB_STENCILREFMASK].u32 & 0xFF;
+    // Stencil reference value. Per-face reference not supported by Direct3D 12,
+    // choose the back face one only if drawing only back faces.
+    uint32_t stencil_ref;
+    if (primitive_two_faced && (regs[XE_GPU_REG_RB_DEPTHCONTROL].u32 & 0x80) &&
+        (regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL].u32 & 0x3) == 1) {
+      stencil_ref = regs[XE_GPU_REG_RB_STENCILREFMASK_BF].u32 & 0xFF;
+    } else {
+      stencil_ref = regs[XE_GPU_REG_RB_STENCILREFMASK].u32 & 0xFF;
+    }
     ff_stencil_ref_update_needed_ |= ff_stencil_ref_ != stencil_ref;
     if (ff_stencil_ref_update_needed_) {
       ff_stencil_ref_ = stencil_ref;
@@ -1954,7 +1970,7 @@ void D3D12CommandProcessor::UpdateFixedFunctionState() {
 }
 
 void D3D12CommandProcessor::UpdateSystemConstantValues(
-    bool shared_memory_is_uav, PrimitiveType primitive_type,
+    bool shared_memory_is_uav, bool primitive_two_faced,
     uint32_t line_loop_closing_index, Endian index_endian,
     uint32_t edge_factor_base, bool early_z, uint32_t color_mask,
     const RenderTargetCache::PipelineRenderTarget render_targets[4]) {
@@ -1975,6 +1991,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   uint32_t rb_depth_info = regs[XE_GPU_REG_RB_DEPTH_INFO].u32;
   uint32_t rb_depthcontrol = regs[XE_GPU_REG_RB_DEPTHCONTROL].u32;
   uint32_t rb_stencilrefmask = regs[XE_GPU_REG_RB_STENCILREFMASK].u32;
+  uint32_t rb_stencilrefmask_bf = regs[XE_GPU_REG_RB_STENCILREFMASK_BF].u32;
   uint32_t rb_surface_info = regs[XE_GPU_REG_RB_SURFACE_INFO].u32;
   uint32_t sq_context_misc = regs[XE_GPU_REG_SQ_CONTEXT_MISC].u32;
   uint32_t sq_program_cntl = regs[XE_GPU_REG_SQ_PROGRAM_CNTL].u32;
@@ -2195,18 +2212,25 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   float viewport_scale_y = regs[XE_GPU_REG_PA_CL_VPORT_YSCALE].f32;
   bool gl_clip_space_def =
       !(pa_cl_clip_cntl & (1 << 19)) && (pa_cl_vte_cntl & (1 << 4));
-  float ndc_scale_x, ndc_scale_y;
-  if (pa_cl_vte_cntl & (1 << 0)) {
-    ndc_scale_x = viewport_scale_x >= 0.0f ? 1.0f : -1.0f;
+  float ndc_scale_x, ndc_scale_y, ndc_scale_z;
+  if (primitive_two_faced && (pa_su_sc_mode_cntl & 0x3) == 0x3) {
+    // Kill all primitives if both faces are culled, but the vertex shader still
+    // needs to do memexport (not NaN because of comparison for setting the
+    // dirty flag).
+    ndc_scale_x = ndc_scale_y = ndc_scale_z = 0;
   } else {
-    ndc_scale_x = 1.0f / 1280.0f;
+    if (pa_cl_vte_cntl & (1 << 0)) {
+      ndc_scale_x = viewport_scale_x >= 0.0f ? 1.0f : -1.0f;
+    } else {
+      ndc_scale_x = 1.0f / 1280.0f;
+    }
+    if (pa_cl_vte_cntl & (1 << 2)) {
+      ndc_scale_y = viewport_scale_y >= 0.0f ? -1.0f : 1.0f;
+    } else {
+      ndc_scale_y = -1.0f / 1280.0f;
+    }
+    ndc_scale_z = gl_clip_space_def ? 0.5f : 1.0f;
   }
-  if (pa_cl_vte_cntl & (1 << 2)) {
-    ndc_scale_y = viewport_scale_y >= 0.0f ? -1.0f : 1.0f;
-  } else {
-    ndc_scale_y = -1.0f / 1280.0f;
-  }
-  float ndc_scale_z = gl_clip_space_def ? 0.5f : 1.0f;
   float ndc_offset_x = (pa_cl_vte_cntl & (1 << 1)) ? 0.0f : -1.0f;
   float ndc_offset_y = (pa_cl_vte_cntl & (1 << 3)) ? 0.0f : 1.0f;
   float ndc_offset_z = gl_clip_space_def ? 0.5f : 0.0f;
@@ -2376,6 +2400,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
             DxbcShaderTranslator::ROV_AddColorFormatFlags(color_format);
         dirty |= system_constants_.edram_rt_format_flags[i] != format_flags;
         system_constants_.edram_rt_format_flags[i] = format_flags;
+        // Can't do float comparisons here because NaNs would result in always
+        // setting the dirty flag.
         dirty |= std::memcmp(system_constants_.edram_rt_clamp[i], rt_clamp[i],
                              4 * sizeof(float)) != 0;
         std::memcpy(system_constants_.edram_rt_clamp[i], rt_clamp[i],
@@ -2419,25 +2445,12 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     dirty |= system_constants_.edram_depth_range_offset != depth_range_offset;
     system_constants_.edram_depth_range_offset = depth_range_offset;
 
-    // For points and lines, front polygon offset is used, and it's enabled if
+    // For non-polygons, front polygon offset is used, and it's enabled if
     // POLY_OFFSET_PARA_ENABLED is set, for polygons, separate front and back
     // are used.
     float poly_offset_front_scale = 0.0f, poly_offset_front_offset = 0.0f;
     float poly_offset_back_scale = 0.0f, poly_offset_back_offset = 0.0f;
-    if (primitive_type == PrimitiveType::kPointList ||
-        primitive_type == PrimitiveType::kLineList ||
-        primitive_type == PrimitiveType::kLineStrip ||
-        primitive_type == PrimitiveType::kLineLoop ||
-        primitive_type == PrimitiveType::k2DLineStrip) {
-      if (pa_su_sc_mode_cntl & (1 << 13)) {
-        poly_offset_front_scale =
-            regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE].f32;
-        poly_offset_front_offset =
-            regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET].f32;
-        poly_offset_back_scale = poly_offset_front_scale;
-        poly_offset_back_offset = poly_offset_front_offset;
-      }
-    } else {
+    if (primitive_two_faced) {
       if (pa_su_sc_mode_cntl & (1 << 11)) {
         poly_offset_front_scale =
             regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE].f32;
@@ -2449,6 +2462,15 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
             regs[XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE].f32;
         poly_offset_back_offset =
             regs[XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET].f32;
+      }
+    } else {
+      if (pa_su_sc_mode_cntl & (1 << 13)) {
+        poly_offset_front_scale =
+            regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE].f32;
+        poly_offset_front_offset =
+            regs[XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET].f32;
+        poly_offset_back_scale = poly_offset_front_scale;
+        poly_offset_back_offset = poly_offset_front_offset;
       }
     }
     // "slope computed in subpixels (1/12 or 1/16)" - R5xx Acceleration. Also:
@@ -2476,56 +2498,35 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       uint32_t stencil_value;
 
       stencil_value = rb_stencilrefmask & 0xFF;
-      dirty |= system_constants_.edram_stencil_reference != stencil_value;
-      system_constants_.edram_stencil_reference = stencil_value;
+      dirty |= system_constants_.edram_stencil_front_reference != stencil_value;
+      system_constants_.edram_stencil_front_reference = stencil_value;
       stencil_value = (rb_stencilrefmask >> 8) & 0xFF;
-      dirty |= system_constants_.edram_stencil_read_mask != stencil_value;
-      system_constants_.edram_stencil_read_mask = stencil_value;
+      dirty |= system_constants_.edram_stencil_front_read_mask != stencil_value;
+      system_constants_.edram_stencil_front_read_mask = stencil_value;
       stencil_value = (rb_stencilrefmask >> 16) & 0xFF;
-      dirty |= system_constants_.edram_stencil_write_mask != stencil_value;
-      system_constants_.edram_stencil_write_mask = stencil_value;
-
-      static const uint32_t kStencilOpMap[] = {
-          DxbcShaderTranslator::kStencilOp_Keep,
-          DxbcShaderTranslator::kStencilOp_Zero,
-          DxbcShaderTranslator::kStencilOp_Replace,
-          DxbcShaderTranslator::kStencilOp_IncrementSaturate,
-          DxbcShaderTranslator::kStencilOp_DecrementSaturate,
-          DxbcShaderTranslator::kStencilOp_Invert,
-          DxbcShaderTranslator::kStencilOp_Increment,
-          DxbcShaderTranslator::kStencilOp_Decrement,
-      };
-
-      stencil_value = kStencilOpMap[(rb_depthcontrol >> 11) & 0x7];
-      dirty |= system_constants_.edram_stencil_front_fail != stencil_value;
-      system_constants_.edram_stencil_front_fail = stencil_value;
-      stencil_value = kStencilOpMap[(rb_depthcontrol >> 17) & 0x7];
       dirty |=
-          system_constants_.edram_stencil_front_depth_fail != stencil_value;
-      system_constants_.edram_stencil_front_depth_fail = stencil_value;
-      stencil_value = kStencilOpMap[(rb_depthcontrol >> 14) & 0x7];
-      dirty |= system_constants_.edram_stencil_front_pass != stencil_value;
-      system_constants_.edram_stencil_front_pass = stencil_value;
-      stencil_value = (rb_depthcontrol >> 8) & 0x7;
-      dirty |=
-          system_constants_.edram_stencil_front_comparison != stencil_value;
-      system_constants_.edram_stencil_front_comparison = stencil_value;
+          system_constants_.edram_stencil_front_write_mask != stencil_value;
+      system_constants_.edram_stencil_front_write_mask = stencil_value;
+      stencil_value = (rb_depthcontrol >> 8) & ((1 << 12) - 1);
+      dirty |= system_constants_.edram_stencil_front_func_ops != stencil_value;
+      system_constants_.edram_stencil_front_func_ops = stencil_value;
 
-      if (rb_depthcontrol & 0x80) {
-        stencil_value = kStencilOpMap[(rb_depthcontrol >> 23) & 0x7];
-        dirty |= system_constants_.edram_stencil_back_fail != stencil_value;
-        system_constants_.edram_stencil_back_fail = stencil_value;
-        stencil_value = kStencilOpMap[(rb_depthcontrol >> 29) & 0x7];
+      if (primitive_two_faced && (rb_depthcontrol & 0x80)) {
+        stencil_value = rb_stencilrefmask_bf & 0xFF;
         dirty |=
-            system_constants_.edram_stencil_back_depth_fail != stencil_value;
-        system_constants_.edram_stencil_back_depth_fail = stencil_value;
-        stencil_value = kStencilOpMap[(rb_depthcontrol >> 26) & 0x7];
-        dirty |= system_constants_.edram_stencil_back_pass != stencil_value;
-        system_constants_.edram_stencil_back_pass = stencil_value;
-        stencil_value = (rb_depthcontrol >> 20) & 0x7;
+            system_constants_.edram_stencil_back_reference != stencil_value;
+        system_constants_.edram_stencil_back_reference = stencil_value;
+        stencil_value = (rb_stencilrefmask_bf >> 8) & 0xFF;
         dirty |=
-            system_constants_.edram_stencil_back_comparison != stencil_value;
-        system_constants_.edram_stencil_back_comparison = stencil_value;
+            system_constants_.edram_stencil_back_read_mask != stencil_value;
+        system_constants_.edram_stencil_back_read_mask = stencil_value;
+        stencil_value = (rb_stencilrefmask_bf >> 16) & 0xFF;
+        dirty |=
+            system_constants_.edram_stencil_back_write_mask != stencil_value;
+        system_constants_.edram_stencil_back_write_mask = stencil_value;
+        stencil_value = (rb_depthcontrol >> 20) & ((1 << 12) - 1);
+        dirty |= system_constants_.edram_stencil_back_func_ops != stencil_value;
+        system_constants_.edram_stencil_back_func_ops = stencil_value;
       } else {
         dirty |= std::memcmp(system_constants_.edram_stencil_back,
                              system_constants_.edram_stencil_front,
