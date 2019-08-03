@@ -699,23 +699,23 @@ void* PrimitiveConverter::AllocateIndices(
   return mapping + simd_offset;
 }
 
-void PrimitiveConverter::MemoryWriteCallback(uint32_t page_first,
-                                             uint32_t page_last) {
+std::pair<uint32_t, uint32_t> PrimitiveConverter::MemoryWriteCallback(
+    uint32_t physical_address_start, uint32_t length) {
   // 1 bit = (512 / 64) MB = 8 MB. Invalidate a region of this size.
-  uint32_t bit_index_first = (page_first * system_page_size_) >> 23;
-  uint32_t bit_index_last = (page_last * system_page_size_) >> 23;
+  uint32_t bit_index_first = physical_address_start >> 23;
+  uint32_t bit_index_last = (physical_address_start + length - 1) >> 23;
   uint64_t bits = ~((1ull << bit_index_first) - 1);
   if (bit_index_last < 63) {
     bits &= (1ull << (bit_index_last + 1)) - 1;
   }
   memory_regions_invalidated_ |= bits;
+  return std::make_pair<uint32_t, uint32_t>(0, UINT32_MAX);
 }
 
-void PrimitiveConverter::MemoryWriteCallbackThunk(void* context_ptr,
-                                                  uint32_t page_first,
-                                                  uint32_t page_last) {
-  reinterpret_cast<PrimitiveConverter*>(context_ptr)
-      ->MemoryWriteCallback(page_first, page_last);
+std::pair<uint32_t, uint32_t> PrimitiveConverter::MemoryWriteCallbackThunk(
+    void* context_ptr, uint32_t physical_address_start, uint32_t length) {
+  return reinterpret_cast<PrimitiveConverter*>(context_ptr)
+      ->MemoryWriteCallback(physical_address_start, length);
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS PrimitiveConverter::GetStaticIndexBuffer(

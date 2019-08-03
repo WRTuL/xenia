@@ -146,11 +146,16 @@ const TextureCache::HostFormat TextureCache::host_formats_[64] = {
      LoadMode::kUnknown, DXGI_FORMAT_R8G8_UNORM, ResolveTileMode::k16bpp,
      false},
     // k_Cr_Y1_Cb_Y0_REP
-    {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, LoadMode::kUnknown,
+    {DXGI_FORMAT_G8R8_G8B8_UNORM, DXGI_FORMAT_G8R8_G8B8_UNORM, LoadMode::k32bpb,
      DXGI_FORMAT_UNKNOWN, LoadMode::kUnknown, DXGI_FORMAT_UNKNOWN,
      LoadMode::kUnknown, DXGI_FORMAT_UNKNOWN, ResolveTileMode::kUnknown, false},
     // k_Y1_Cr_Y0_Cb_REP
-    {DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, LoadMode::kUnknown,
+    // Used for videos in NBA 2K9. Red and blue must be flipped.
+    // TODO(Triang3l): D3DFMT_G8R8_G8B8 is DXGI_FORMAT_R8G8_B8G8_UNORM * 255.0f,
+    // watch out for num_format int, division in shaders, etc., in NBA 2K9 it
+    // works as is. Also need to decompress if the size is uneven, but should be
+    // a very rare case.
+    {DXGI_FORMAT_R8G8_B8G8_UNORM, DXGI_FORMAT_R8G8_B8G8_UNORM, LoadMode::k32bpb,
      DXGI_FORMAT_UNKNOWN, LoadMode::kUnknown, DXGI_FORMAT_UNKNOWN,
      LoadMode::kUnknown, DXGI_FORMAT_UNKNOWN, ResolveTileMode::kUnknown, false},
     // k_16_16_EDRAM
@@ -1262,7 +1267,7 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled,
     uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
     uint32_t block_first = page_first >> 5;
     uint32_t block_last = page_last >> 5;
-    shared_memory_->LockWatchMutex();
+    auto watch_lock = shared_memory_->LockWatchMutex();
     for (uint32_t i = block_first; i <= block_last; ++i) {
       uint32_t add_bits = UINT32_MAX;
       if (i == block_first) {
@@ -1274,7 +1279,6 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled,
       scaled_resolve_pages_[i] |= add_bits;
       scaled_resolve_pages_l2_[i >> 6] |= 1ull << (i & 63);
     }
-    shared_memory_->UnlockWatchMutex();
   }
 
   // Invalidate textures. Toggling individual textures between scaled and
@@ -1287,7 +1291,15 @@ bool TextureCache::TileResolvedTexture(
     uint32_t texture_height, bool is_3d, uint32_t offset_x, uint32_t offset_y,
     uint32_t offset_z, uint32_t resolve_width, uint32_t resolve_height,
     Endian128 endian, ID3D12Resource* buffer, uint32_t buffer_size,
-    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint) {
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint,
+    uint32_t* written_address_out, uint32_t* written_length_out) {
+  if (written_address_out) {
+    *written_address_out = 0;
+  }
+  if (written_length_out) {
+    *written_length_out = 0;
+  }
+
   ResolveTileMode resolve_tile_mode =
       host_formats_[uint32_t(format)].resolve_tile_mode;
   if (resolve_tile_mode == ResolveTileMode::kUnknown) {
@@ -1452,6 +1464,12 @@ bool TextureCache::TileResolvedTexture(
 
   // Invalidate textures and mark the range as scaled if needed.
   MarkRangeAsResolved(texture_modified_start, texture_modified_length);
+  if (written_address_out) {
+    *written_address_out = texture_modified_start;
+  }
+  if (written_length_out) {
+    *written_length_out = texture_modified_length;
+  }
 
   return true;
 }
@@ -1727,12 +1745,14 @@ void TextureCache::BindingInfoFromFetchConstant(
 
   if (swizzle_out != nullptr) {
     uint32_t swizzle = fetch.swizzle;
-    const uint32_t swizzle_constant_mask = 4 | (4 << 3) | (4 << 6) | (4 << 9);
-    uint32_t swizzle_constant = swizzle & swizzle_constant_mask;
-    uint32_t swizzle_not_constant = swizzle_constant ^ swizzle_constant_mask;
+    // 0b000 or 0b111 mask for 0 or 1 swizzles.
+    uint32_t swizzle_constant = swizzle & 0b100100100100;
+    swizzle_constant |= (swizzle_constant >> 1) | (swizzle_constant >> 2);
+    // 0b000 or 0b111 mask for RGBA swizzles.
+    uint32_t swizzle_not_constant = swizzle_constant ^ 0b111111111111;
     // Get rid of 6 and 7 values (to prevent device losses if the game has
     // something broken) the quick and dirty way - by changing them to 4 and 5.
-    swizzle &= ~(swizzle_constant >> 1);
+    swizzle &= 0b101101101101 | swizzle_not_constant;
     // Remap the swizzle according to the texture format. k_1_5_5_5, k_5_6_5 and
     // k_4_4_4_4 already have red and blue swapped in the load shader for
     // simplicity.
@@ -1740,16 +1760,20 @@ void TextureCache::BindingInfoFromFetchConstant(
       // Green bits of the texture used for blue, and blue bits used for green.
       // Swap 001 and 010 (XOR 011 if either 001 or 010).
       uint32_t swizzle_green_or_blue =
-          ((swizzle & 0b001001001001) ^ ((swizzle >> 1) & 0b001001001001)) &
-          swizzle_not_constant;
-      swizzle ^= swizzle_green_or_blue | (swizzle_green_or_blue << 1);
+          (swizzle & 0b001001001001) ^ ((swizzle >> 1) & 0b001001001001);
+      swizzle ^= (swizzle_green_or_blue | (swizzle_green_or_blue << 1)) &
+                 swizzle_not_constant;
+    } else if (format == TextureFormat::k_Cr_Y1_Cb_Y0_REP ||
+               format == TextureFormat::k_Y1_Cr_Y0_Cb_REP) {
+      // Swap red and blue.
+      swizzle ^= ((~swizzle & 0b001001001001) << 1) & swizzle_not_constant;
     } else if (host_formats_[uint32_t(format)].replicate_component) {
       // Replicate the only component of single-component textures, which are
       // emulated with red formats (including DXT3A, which uses R8 rather than
       // DXT3 because the resulting size is the same, but there's no 4x4
       // alignment requirement). If not 0.0 or 1.0 (if the high bit isn't set),
       // make 0 (red).
-      swizzle &= ~((swizzle_not_constant >> 1) | (swizzle_not_constant >> 2));
+      swizzle &= swizzle_constant;
     }
     *swizzle_out = swizzle;
   }
@@ -1959,10 +1983,12 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
 
 bool TextureCache::LoadTextureData(Texture* texture) {
   // See what we need to upload.
-  shared_memory_->LockWatchMutex();
-  bool base_in_sync = texture->base_in_sync;
-  bool mips_in_sync = texture->mips_in_sync;
-  shared_memory_->UnlockWatchMutex();
+  bool base_in_sync, mips_in_sync;
+  {
+    auto watch_lock = shared_memory_->LockWatchMutex();
+    base_in_sync = texture->base_in_sync;
+    mips_in_sync = texture->mips_in_sync;
+  }
   if (base_in_sync && mips_in_sync) {
     return true;
   }
@@ -2224,20 +2250,21 @@ bool TextureCache::LoadTextureData(Texture* texture) {
   // resolves as well to detect when the CPU wants to reuse the memory for a
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
-  shared_memory_->LockWatchMutex();
-  texture->base_in_sync = true;
-  texture->mips_in_sync = true;
-  if (!base_in_sync) {
-    texture->base_watch_handle = shared_memory_->WatchMemoryRange(
-        texture->key.base_page << 12, texture->base_size, WatchCallbackThunk,
-        this, texture, 0);
+  {
+    auto watch_lock = shared_memory_->LockWatchMutex();
+    texture->base_in_sync = true;
+    texture->mips_in_sync = true;
+    if (!base_in_sync) {
+      texture->base_watch_handle = shared_memory_->WatchMemoryRange(
+          texture->key.base_page << 12, texture->base_size, WatchCallbackThunk,
+          this, texture, 0);
+    }
+    if (!mips_in_sync) {
+      texture->mip_watch_handle = shared_memory_->WatchMemoryRange(
+          texture->key.mip_page << 12, texture->mip_size, WatchCallbackThunk,
+          this, texture, 1);
+    }
   }
-  if (!mips_in_sync) {
-    texture->mip_watch_handle = shared_memory_->WatchMemoryRange(
-        texture->key.mip_page << 12, texture->mip_size, WatchCallbackThunk,
-        this, texture, 1);
-  }
-  shared_memory_->UnlockWatchMutex();
 
   LogTextureAction(texture, "Loaded");
   return true;
@@ -2314,7 +2341,7 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled,
   uint32_t block_last = page_last >> 5;
   uint32_t l2_block_first = block_first >> 6;
   uint32_t l2_block_last = block_last >> 6;
-  shared_memory_->LockWatchMutex();
+  auto watch_lock = shared_memory_->LockWatchMutex();
   for (uint32_t i = l2_block_first; i <= l2_block_last; ++i) {
     uint64_t l2_block = scaled_resolve_pages_l2_[i];
     if (i == l2_block_first) {
@@ -2335,12 +2362,10 @@ bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled,
         check_bits &= (1u << ((page_last & 31) + 1)) - 1;
       }
       if (scaled_resolve_pages_[block_index] & check_bits) {
-        shared_memory_->UnlockWatchMutex();
         return true;
       }
     }
   }
-  shared_memory_->UnlockWatchMutex();
   return false;
 }
 
