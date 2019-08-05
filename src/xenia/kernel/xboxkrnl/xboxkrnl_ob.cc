@@ -109,6 +109,11 @@ dword_result_t ObReferenceObjectByHandle(dword_t handle,
           } break;
         }
       } break;
+      case 0xD00EBEEF: {  // ExEventObjectType
+        assert(object->type() == XObject::kTypeEvent);
+        native_ptr = object->guest_object();
+        assert_not_zero(native_ptr);
+      } break;
       case 0xD017BEEF: {  // ExSemaphoreObjectType
         assert(object->type() == XObject::kTypeSemaphore);
         native_ptr = object->guest_object();
@@ -138,6 +143,21 @@ dword_result_t ObReferenceObjectByHandle(dword_t handle,
   return result;
 }
 DECLARE_XBOXKRNL_EXPORT1(ObReferenceObjectByHandle, kNone, kImplemented);
+
+dword_result_t ObReferenceObjectByName(lpstring_t name, dword_t attributes,
+                                       dword_t object_type_ptr,
+                                       lpvoid_t parse_context,
+                                       lpdword_t out_object_ptr) {
+  X_HANDLE handle = X_INVALID_HANDLE_VALUE;
+  X_STATUS result =
+      kernel_state()->object_table()->GetObjectByName(name.value(), &handle);
+  if (XSUCCEEDED(result)) {
+    return ObReferenceObjectByHandle(handle, object_type_ptr, out_object_ptr);
+  }
+
+  return result;
+}
+DECLARE_XBOXKRNL_EXPORT1(ObReferenceObjectByName, kNone, kImplemented);
 
 dword_result_t ObDereferenceObject(dword_t native_ptr) {
   // Check if a dummy value from ObReferenceObjectByHandle.

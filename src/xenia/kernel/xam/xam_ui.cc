@@ -10,6 +10,7 @@
 #include "third_party/imgui/imgui.h"
 #include "xenia/base/logging.h"
 #include "xenia/emulator.h"
+#include "xenia/kernel/kernel_flags.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_private.h"
@@ -110,8 +111,11 @@ dword_result_t XamShowMessageBoxUI(dword_t user_index, lpwstring_t title_ptr,
     buttons.push_back(button);
   }
 
+  // Broadcast XN_SYS_UI = true
+  kernel_state()->BroadcastNotification(0x9, true);
+
   uint32_t chosen_button;
-  if (FLAGS_headless) {
+  if (cvars::headless) {
     // Auto-pick the focused button.
     chosen_button = active_button;
   } else {
@@ -142,6 +146,9 @@ dword_result_t XamShowMessageBoxUI(dword_t user_index, lpwstring_t title_ptr,
     --xam_dialogs_shown_;
   }
   *result_ptr = chosen_button;
+
+  // Broadcast XN_SYS_UI = false
+  kernel_state()->BroadcastNotification(0x9, false);
 
   if (overlapped) {
     kernel_state()->CompleteOverlappedImmediate(overlapped, X_ERROR_SUCCESS);
@@ -231,12 +238,18 @@ dword_result_t XamShowKeyboardUI(dword_t user_index, dword_t flags,
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  if (FLAGS_headless) {
+  // Broadcast XN_SYS_UI = true
+  kernel_state()->BroadcastNotification(0x9, true);
+
+  if (cvars::headless) {
     // Redirect default_text back into the buffer.
     std::memset(buffer, 0, buffer_length * 2);
     if (default_text) {
       xe::store_and_swap<std::wstring>(buffer, default_text.value());
     }
+
+    // Broadcast XN_SYS_UI = false
+    kernel_state()->BroadcastNotification(0x9, false);
 
     if (overlapped) {
       kernel_state()->CompleteOverlappedImmediate(overlapped, X_ERROR_SUCCESS);
@@ -267,6 +280,9 @@ dword_result_t XamShowKeyboardUI(dword_t user_index, dword_t flags,
   // Truncate the string.
   out_text = out_text.substr(0, buffer_length - 1);
   xe::store_and_swap<std::wstring>(buffer, out_text);
+
+  // Broadcast XN_SYS_UI = false
+  kernel_state()->BroadcastNotification(0x9, false);
 
   if (overlapped) {
     kernel_state()->CompleteOverlappedImmediate(overlapped, X_ERROR_SUCCESS);
@@ -299,6 +315,10 @@ dword_result_t XamShowDeviceSelectorUI(dword_t user_index, dword_t content_type,
       break;
   }
 
+  // Broadcast XN_SYS_UI = true followed by XN_SYS_UI = false
+  kernel_state()->BroadcastNotification(0x9, true);
+  kernel_state()->BroadcastNotification(0x9, false);
+
   if (overlapped) {
     kernel_state()->CompleteOverlappedImmediate(overlapped, X_ERROR_SUCCESS);
     return X_ERROR_IO_PENDING;
@@ -309,7 +329,7 @@ dword_result_t XamShowDeviceSelectorUI(dword_t user_index, dword_t content_type,
 DECLARE_XAM_EXPORT1(XamShowDeviceSelectorUI, kUI, kImplemented);
 
 void XamShowDirtyDiscErrorUI(dword_t user_index) {
-  if (FLAGS_headless) {
+  if (cvars::headless) {
     assert_always();
     exit(1);
     return;

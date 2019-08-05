@@ -17,9 +17,6 @@ project("xenia-gpu-vulkan")
   })
   defines({
   })
-  includedirs({
-    project_root.."/third_party/gflags/src",
-  })
   local_platform_files()
   files({
     "shaders/bin/*.h",
@@ -32,8 +29,8 @@ project("xenia-gpu-vulkan-trace-viewer")
   kind("WindowedApp")
   language("C++")
   links({
+    "aes_128",
     "capstone",
-    "gflags",
     "glslang-spirv",
     "imgui",
     "libavcodec",
@@ -59,13 +56,7 @@ project("xenia-gpu-vulkan-trace-viewer")
     "xenia-vfs",
     "xxhash",
   })
-  flags({
-    "WinMain",  -- Use WinMain instead of main.
-  })
   defines({
-  })
-  includedirs({
-    project_root.."/third_party/gflags/src",
   })
   files({
     "vulkan_trace_viewer_main.cc",
@@ -93,7 +84,6 @@ project("xenia-gpu-vulkan-trace-viewer")
     if not os.isfile(user_file) then
       debugdir(project_root)
       debugargs({
-        "--flagfile=scratch/flags.txt",
         "2>&1",
         "1>scratch/stdout-trace-viewer.txt",
       })
@@ -105,8 +95,8 @@ project("xenia-gpu-vulkan-trace-dump")
   kind("ConsoleApp")
   language("C++")
   links({
+    "aes_128",
     "capstone",
-    "gflags",
     "glslang-spirv",
     "imgui",
     "libavcodec",
@@ -134,9 +124,6 @@ project("xenia-gpu-vulkan-trace-dump")
   })
   defines({
   })
-  includedirs({
-    project_root.."/third_party/gflags/src",
-  })
   files({
     "vulkan_trace_dump_main.cc",
     "../../base/main_"..platform_suffix..".cc",
@@ -157,7 +144,6 @@ project("xenia-gpu-vulkan-trace-dump")
     if not os.isfile(user_file) then
       debugdir(project_root)
       debugargs({
-        "--flagfile=scratch/flags.txt",
         "2>&1",
         "1>scratch/stdout-trace-dump.txt",
       })

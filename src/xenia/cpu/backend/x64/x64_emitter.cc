@@ -9,8 +9,6 @@
 
 #include "xenia/cpu/backend/x64/x64_emitter.h"
 
-#include <gflags/gflags.h>
-
 #include <stddef.h>
 #include <climits>
 #include <cstring>
@@ -35,12 +33,13 @@
 #include "xenia/cpu/symbol.h"
 #include "xenia/cpu/thread_state.h"
 
-DEFINE_bool(enable_debugprint_log, false,
-            "Log debugprint traps to the active debugger");
+DEFINE_bool(debugprint_trap_log, false,
+            "Log debugprint traps to the active debugger", "CPU");
 DEFINE_bool(ignore_undefined_externs, true,
-            "Don't exit when an undefined extern is called.");
+            "Don't exit when an undefined extern is called.", "CPU");
 DEFINE_bool(emit_source_annotations, false,
-            "Add extra movs and nops to make disassembly easier to read.");
+            "Add extra movs and nops to make disassembly easier to read.",
+            "CPU");
 
 namespace xe {
 namespace cpu {
@@ -71,7 +70,7 @@ X64Emitter::X64Emitter(X64Backend* backend, XbyakAllocator* allocator)
       backend_(backend),
       code_cache_(backend->code_cache()),
       allocator_(allocator) {
-  if (FLAGS_enable_haswell_instructions) {
+  if (cvars::use_haswell_instructions) {
     feature_flags_ |= cpu_.has(Xbyak::util::Cpu::tAVX2) ? kX64EmitAVX2 : 0;
     feature_flags_ |= cpu_.has(Xbyak::util::Cpu::tFMA) ? kX64EmitFMA : 0;
     feature_flags_ |= cpu_.has(Xbyak::util::Cpu::tLZCNT) ? kX64EmitLZCNT : 0;
@@ -245,7 +244,7 @@ bool X64Emitter::Emit(HIRBuilder* builder, size_t* out_stack_size) {
   add(rsp, (uint32_t)stack_size);
   ret();
 
-  if (FLAGS_emit_source_annotations) {
+  if (cvars::emit_source_annotations) {
     nop();
     nop();
     nop();
@@ -262,7 +261,7 @@ void X64Emitter::MarkSourceOffset(const Instr* i) {
   entry->hir_offset = uint32_t(i->block->ordinal << 16) | i->ordinal;
   entry->code_offset = static_cast<uint32_t>(getSize());
 
-  if (FLAGS_emit_source_annotations) {
+  if (cvars::emit_source_annotations) {
     nop();
     nop();
     mov(eax, entry->guest_address);
@@ -299,7 +298,7 @@ uint64_t TrapDebugPrint(void* raw_context, uint64_t address) {
   // TODO(benvanik): truncate to length?
   XELOGD("(DebugPrint) %s", str);
 
-  if (FLAGS_enable_debugprint_log) {
+  if (cvars::debugprint_trap_log) {
     debugging::DebugPrint("(DebugPrint) %s", str);
   }
 
@@ -309,7 +308,7 @@ uint64_t TrapDebugPrint(void* raw_context, uint64_t address) {
 uint64_t TrapDebugBreak(void* raw_context, uint64_t address) {
   auto thread_state = *reinterpret_cast<ThreadState**>(raw_context);
   XELOGE("tw/td forced trap hit! This should be a crash!");
-  if (FLAGS_break_on_debugbreak) {
+  if (cvars::break_on_debugbreak) {
     xe::debugging::Break();
   }
   return 0;
@@ -446,7 +445,7 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
 
 uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
   auto function = reinterpret_cast<Function*>(function_ptr);
-  if (!FLAGS_ignore_undefined_externs) {
+  if (!cvars::ignore_undefined_externs) {
     xe::FatalError("undefined extern call to %.8X %s", function->address(),
                    function->name().c_str());
   } else {
@@ -642,7 +641,7 @@ static const vec128_t xmm_consts[] = {
     /* XMMUnpackFLOAT16_2     */
     vec128i(0x0D0C0F0Eu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu),
     /* XMMPackFLOAT16_4       */
-    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0x05040706u, 0x01000302u),
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0x01000302u, 0x05040706u),
     /* XMMUnpackFLOAT16_4     */
     vec128i(0x09080B0Au, 0x0D0C0F0Eu, 0xFFFFFFFFu, 0xFFFFFFFFu),
     /* XMMPackSHORT_Min       */ vec128i(0x403F8001u),
@@ -666,7 +665,19 @@ static const vec128_t xmm_consts[] = {
     vec128i(0x3FFu, 0x3FFu << 10, 0x3FFu << 20, 0x3u << 30),
     /* XMMPackUINT_2101010_Shift */ vec128i(0, 10, 20, 30),
     /* XMMUnpackUINT_2101010_Overflow */ vec128i(0x403FFE00u),
-    /* XMMUnpackOverflowNaN   */ vec128i(0x7FC00000u),
+    /* XMMPackULONG_4202020_MinUnpacked */
+    vec128i(0x40380001u, 0x40380001u, 0x40380001u, 0x40400000u),
+    /* XMMPackULONG_4202020_MaxUnpacked */
+    vec128i(0x4047FFFFu, 0x4047FFFFu, 0x4047FFFFu, 0x4040000Fu),
+    /* XMMPackULONG_4202020_MaskUnpacked */
+    vec128i(0xFFFFFu, 0xFFFFFu, 0xFFFFFu, 0xFu),
+    /* XMMPackULONG_4202020_PermuteXZ */
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0x0A0908FFu, 0xFF020100u),
+    /* XMMPackULONG_4202020_PermuteYW */
+    vec128i(0xFFFFFFFFu, 0xFFFFFFFFu, 0x0CFFFF06u, 0x0504FFFFu),
+    /* XMMUnpackULONG_4202020_Permute */
+    vec128i(0xFF0E0D0Cu, 0xFF0B0A09u, 0xFF080F0Eu, 0xFFFFFF0Bu),
+    /* XMMUnpackULONG_4202020_Overflow */ vec128i(0x40380000u),
     /* XMMOneOver255          */ vec128f(1.0f / 255.0f),
     /* XMMMaskEvenPI16        */
     vec128i(0x0000FFFFu, 0x0000FFFFu, 0x0000FFFFu, 0x0000FFFFu),
@@ -696,6 +707,7 @@ static const vec128_t xmm_consts[] = {
     /* XMMIntMax              */ vec128i(INT_MAX),
     /* XMMIntMaxPD            */ vec128d(INT_MAX),
     /* XMMPosIntMinPS         */ vec128f((float)0x80000000u),
+    /* XMMQNaN                */ vec128i(0x7FC00000u),
 };
 
 // First location to try and place constants.

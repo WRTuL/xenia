@@ -145,7 +145,8 @@ class Emulator {
   void WaitUntilExit();
 
  public:
-  xe::Delegate<> on_launch;
+  xe::Delegate<uint32_t, const std::wstring&> on_launch;
+  xe::Delegate<> on_terminate;
   xe::Delegate<> on_exit;
 
  private:
@@ -175,11 +176,11 @@ class Emulator {
   std::unique_ptr<vfs::VirtualFileSystem> file_system_;
 
   std::unique_ptr<kernel::KernelState> kernel_state_;
-  threading::Thread* main_thread_ = nullptr;
-  uint32_t title_id_ = 0;  // Currently running title ID
+  kernel::object_ref<kernel::XThread> main_thread_;
+  uint32_t title_id_;  // Currently running title ID
 
-  bool paused_ = false;
-  bool restoring_ = false;
+  bool paused_;
+  bool restoring_;
   threading::Fence restore_fence_;  // Fired on restore finish.
 };
 
